@@ -38,20 +38,20 @@ void front_frame_presented(void){
 void runtime_boot_progress(const char *stage,uint64_t done,uint64_t total){
  static const char *last;
  if(stage!=last){fprintf(stderr,"[totk-boot] %.3f %s\n",bootStartNS?(runtime_now_ns()-bootStartNS)/1e9:0,stage?stage:"startup");last=stage;}
- NSString *s=[NSString stringWithUTF8String:stage?stage:TOTK_UI("正在启动","Starting")];
+ NSString *s=[NSString stringWithUTF8String:stage?stage:TOTK_UI("正在启动","Starting","Iniciando")];
  dispatch_async(dispatch_get_main_queue(), ^{
   if(!bootOverlay||bootOverlay.hidden)return;
   bootStage.stringValue=s;
   if(total){bootDetail.stringValue=[NSString stringWithFormat:@"%.1f / %.1f GB",done/1e9,total/1e9];
    bootProgress.indeterminate=NO;bootProgress.doubleValue=(double)done/(double)total*100.0;}
-  else {bootDetail.stringValue=@(TOTK_UI("正在处理，请稍候","Working, please wait"));bootProgress.indeterminate=YES;[bootProgress startAnimation:nil];}
+  else {bootDetail.stringValue=@(TOTK_UI("正在处理，请稍候","Working, please wait","Processando, aguarde"));bootProgress.indeterminate=YES;[bootProgress startAnimation:nil];}
  });
 }
 void runtime_boot_count(const char *stage,uint64_t done,uint64_t total){
  /* Steps counted in items, not bytes (the shader import: tens of thousands of files, minutes on a phone). */
  static const char *last;
  if(stage!=last){fprintf(stderr,"[totk-boot] %.3f %s\n",bootStartNS?(runtime_now_ns()-bootStartNS)/1e9:0,stage?stage:"startup");last=stage;}
- NSString *s=[NSString stringWithUTF8String:stage?stage:TOTK_UI("正在启动","Starting")];
+ NSString *s=[NSString stringWithUTF8String:stage?stage:TOTK_UI("正在启动","Starting","Iniciando")];
  dispatch_async(dispatch_get_main_queue(), ^{
   if(!bootOverlay||bootOverlay.hidden)return;
   bootStage.stringValue=s;bootDetail.stringValue=[NSString stringWithFormat:@"%llu / %llu",(unsigned long long)done,(unsigned long long)total];
@@ -60,8 +60,8 @@ void runtime_boot_count(const char *stage,uint64_t done,uint64_t total){
 }
 void runtime_boot_status(const char *stage,const char *detail){
  if(bootStartNS)fprintf(stderr,"[totk-boot] %.3f %s — %s\n",(runtime_now_ns()-bootStartNS)/1e9,stage?stage:"startup",detail?detail:"");
- NSString *s=[NSString stringWithUTF8String:stage?stage:TOTK_UI("正在启动","Starting")];
- NSString *d=[NSString stringWithUTF8String:detail?detail:TOTK_UI("正在处理，请稍候","Working, please wait")];
+ NSString *s=[NSString stringWithUTF8String:stage?stage:TOTK_UI("正在启动","Starting","Iniciando")];
+ NSString *d=[NSString stringWithUTF8String:detail?detail:TOTK_UI("正在处理，请稍候","Working, please wait","Processando, aguarde")];
  dispatch_async(dispatch_get_main_queue(), ^{
   if(!bootOverlay||bootOverlay.hidden)return;
   bootStage.stringValue=s;bootDetail.stringValue=d;
@@ -73,8 +73,8 @@ void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_
  dispatch_async(dispatch_get_main_queue(), ^{
   if(!bootOverlay||bootOverlay.hidden)return;
   double percent=total ? fmin(100.0,(double)done/(double)total*100.0) : 100.0;
-  bootStage.stringValue=[NSString stringWithFormat:@(TOTK_UI("预热着色器与管线 %.0f%%","Warming shaders and pipelines %.0f%%")),floor(percent)];
-  bootDetail.stringValue=[NSString stringWithFormat:@(TOTK_UI("已处理 %llu/%llu 项 · 着色器 %llu/%llu · 管线 %llu/%llu","%llu/%llu items · shaders %llu/%llu · pipelines %llu/%llu")),
+  bootStage.stringValue=[NSString stringWithFormat:@(TOTK_UI("预热着色器与管线 %.0f%%","Warming shaders and pipelines %.0f%%","Pré-aquecendo shaders e pipelines %.0f%%")),floor(percent)];
+  bootDetail.stringValue=[NSString stringWithFormat:@(TOTK_UI("已处理 %llu/%llu 项 · 着色器 %llu/%llu · 管线 %llu/%llu","%llu/%llu items · shaders %llu/%llu · pipelines %llu/%llu","itens %llu/%llu · shaders %llu/%llu · pipelines %llu/%llu")),
       (unsigned long long)done,(unsigned long long)total,(unsigned long long)shaders,(unsigned long long)shader_total,
       (unsigned long long)pipelines,(unsigned long long)pipeline_total];
   bootProgress.indeterminate=NO;
@@ -148,18 +148,18 @@ static NSString *shortcut_text(void){
  const char *interp;
  switch(mfx_enabled()){
   case MFX_30:interp="30+30";break;
-  case MFX_HALF:interp=TOTK_UI("刷新率一半","half refresh rate");break;
-  case MFX_MAX:interp=TOTK_UI("不限帧","unlimited");break;
-  default:interp=TOTK_UI("关闭","off");break;
+  case MFX_HALF:interp=TOTK_UI("刷新率一半","half refresh rate","metade da taxa");break;
+  case MFX_MAX:interp=TOTK_UI("不限帧","unlimited","sem limite");break;
+  default:interp=TOTK_UI("关闭","off","desligada");break;
  }
  uint64_t size=runtime_output_size_current();unsigned w=(uint32_t)size,h=(uint32_t)(size>>32);
  NSString *picture;
  if(mfxup_output_enabled())picture=@"MetalFX 2K";
- else if(w==2560&&h==1440)picture=@(TOTK_UI("原生 2K","native 2K"));
- else if(w!=1920||h!=1080)picture=[NSString stringWithFormat:@(TOTK_UI("原生 %u×%u","native %u×%u")),w,h];
- else picture=@(TOTK_UI("关闭","off"));
- return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  提示：全部 → 只显示 FPS → 隐藏\n2  补帧：当前 %@（按键切换）\n3  画质：当前 %@（按键切换）\n4  21:9 宽屏：开 / 关\n5  边缘平滑（MetalFX 时间性）：%@","Shortcuts\n1  Overlays: all → FPS only → off\n2  Interpolation: %@ (current; press to cycle)\n3  Picture: %@ (current; press to cycle)\n4  Ultrawide 21:9: on / off\n5  Edge smoothing (MetalFX Temporal): %@")),[NSString stringWithUTF8String:interp],picture,
-  taa_enabled()?@(TOTK_UI("开","on")):@(TOTK_UI("关","off"))];
+ else if(w==2560&&h==1440)picture=@(TOTK_UI("原生 2K","native 2K","2K nativo"));
+ else if(w!=1920||h!=1080)picture=[NSString stringWithFormat:@(TOTK_UI("原生 %u×%u","native %u×%u","nativo %u×%u")),w,h];
+ else picture=@(TOTK_UI("关闭","off","desligada"));
+ return [NSString stringWithFormat:@(TOTK_UI("快捷键说明\n1  显示 / 隐藏所有提示\n2  补帧：当前 %@（按键切换）\n3  画质：当前 %@（按键切换）\n4  21:9 宽屏：开 / 关\n5  边缘平滑（MetalFX 时间性）：%@","Shortcuts\n1  Show / hide all overlays\n2  Interpolation: %@ (current; press to cycle)\n3  Picture: %@ (current; press to cycle)\n4  Ultrawide 21:9: on / off\n5  Edge smoothing (MetalFX Temporal): %@","Atalhos\n1  Mostrar / ocultar todas as dicas\n2  Interpolação: %@ (atual; a tecla alterna)\n3  Imagem: %@ (atual; a tecla alterna)\n4  Tela larga 21:9: ligada / desligada\n5  Suavização de borda (MetalFX temporal): %@")),[NSString stringWithUTF8String:interp],picture,
+  taa_enabled()?@(TOTK_UI("开","on","ligado")):@(TOTK_UI("关","off","desligado"))];
 }
 -(instancetype)initWithFrame:(NSRect)frame{if((self=[super initWithFrame:frame])){int compact=hud_compact();self.wantsLayer=YES;self.layer.backgroundColor=[NSColor colorWithCalibratedWhite:0.04 alpha:compact?0.72:0.86].CGColor;self.layer.cornerRadius=compact?7:14;self.layer.borderWidth=1;self.layer.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:compact?0.14:0.2].CGColor;
  self.label=[NSTextField labelWithString:shortcut_text()];self.label.font=[NSFont systemFontOfSize:17 weight:NSFontWeightMedium];self.label.textColor=NSColor.whiteColor;self.label.alignment=NSTextAlignmentCenter;self.label.maximumNumberOfLines=0;self.label.lineBreakMode=NSLineBreakByWordWrapping;self.label.frame=NSInsetRect(self.bounds,20,18);self.label.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;[self addSubview:self.label];
@@ -271,7 +271,7 @@ void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(),
 static void front_install_menu(void){
  NSMenu *menu=[NSMenu new],*appMenu=[NSMenu new];
  NSMenuItem *appItem=[NSMenuItem new];appItem.submenu=appMenu;[menu addItem:appItem];
- NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("退出 " GAME_NAME,"Quit " GAME_NAME)) action:@selector(performClose:) keyEquivalent:@"q"];
+ NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("退出 " GAME_NAME,"Quit " GAME_NAME,"Sair do " GAME_NAME)) action:@selector(performClose:) keyEquivalent:@"q"];
  quit.keyEquivalentModifierMask=NSEventModifierFlagCommand;quit.target=window;
  [appMenu addItem:quit];front_menubar_fps_add(menu);NSApp.mainMenu=menu;
 }
@@ -290,7 +290,7 @@ void runtime_front_run(void(*callback)(void)){
   window.releasedWhenClosed=NO;   /* a close that waits for a save (windowWillClose) must not free the window the static pointer still holds */
   /* An agent's test game (TOTK_SLOT_OWNER other than user) says so in its title: it plays a save copy and its script closes it. */
   const char *owner=getenv("TOTK_SLOT_OWNER"),*purpose=getenv("TOTK_SLOT_PURPOSE");
-  window.title=owner&&*owner&&strcmp(owner,"user")?[NSString stringWithFormat:@(TOTK_UI("测试局（%s）Ver. %s：%s — 存档副本，进度不会存进你的存档，脚本会自己关闭","Test session (%s) Ver. %s: %s — save copy, progress is not saved to your save, the script closes it")),owner,TOTK_GAME_VERSION,purpose&&*purpose?purpose:TOTK_UI("代理测试","agent test")]:[NSString stringWithFormat:@GAME_NAME "  Mac — Ver. %s",TOTK_GAME_VERSION];
+  window.title=owner&&*owner&&strcmp(owner,"user")?[NSString stringWithFormat:@(TOTK_UI("测试局（%s）Ver. %s：%s — 存档副本，进度不会存进你的存档，脚本会自己关闭","Test session (%s) Ver. %s: %s — save copy, progress is not saved to your save, the script closes it","Sessão de teste (%s) Ver. %s: %s — cópia de save, o progresso não vai para o seu save, o script fecha sozinho")),owner,TOTK_GAME_VERSION,purpose&&*purpose?purpose:TOTK_UI("代理测试","agent test","teste de agente")]:[NSString stringWithFormat:@GAME_NAME "  Mac — Ver. %s",TOTK_GAME_VERSION];
   windowDelegate=[TOTKWindowDelegate new];window.delegate=windowDelegate;
   front_install_menu();
   window.collectionBehavior|=NSWindowCollectionBehaviorFullScreenPrimary;
@@ -299,10 +299,10 @@ void runtime_front_run(void(*callback)(void)){
   metalLayer.framebufferOnly=NO;window.contentView.wantsLayer=YES;window.contentView.layer=metalLayer;
   bootOverlay=[[NSView alloc] initWithFrame:window.contentView.bounds];bootOverlay.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
   bootOverlay.wantsLayer=YES;bootOverlay.layer.backgroundColor=[NSColor colorWithCalibratedRed:0.035 green:0.075 blue:0.09 alpha:1].CGColor;
-  bootStage=[NSTextField labelWithString:@(TOTK_UI("正在启动海拉鲁","Starting Hyrule"))];
+  bootStage=[NSTextField labelWithString:@(TOTK_UI("正在启动海拉鲁","Starting Hyrule","Iniciando Hyrule"))];
   bootStage.font=[NSFont systemFontOfSize:25 weight:NSFontWeightSemibold];bootStage.textColor=NSColor.whiteColor;
   bootStage.alignment=NSTextAlignmentCenter;bootStage.frame=NSMakeRect(0,wh/2+20,ww,40);bootStage.autoresizingMask=NSViewWidthSizable|NSViewMinYMargin|NSViewMaxYMargin;
-  bootDetail=[NSTextField labelWithString:@(TOTK_UI("正在准备游戏环境","Preparing the game environment"))];
+  bootDetail=[NSTextField labelWithString:@(TOTK_UI("正在准备游戏环境","Preparing the game environment","Preparando o ambiente do jogo"))];
   bootDetail.font=[NSFont systemFontOfSize:14];bootDetail.textColor=[NSColor colorWithCalibratedWhite:0.72 alpha:1];
   bootDetail.alignment=NSTextAlignmentCenter;bootDetail.frame=NSMakeRect(0,wh/2-20,ww,28);bootDetail.autoresizingMask=NSViewWidthSizable|NSViewMinYMargin|NSViewMaxYMargin;
   bootProgress=[[NSProgressIndicator alloc] initWithFrame:NSMakeRect(ww/2-140,wh/2-55,280,10)];
@@ -393,8 +393,8 @@ int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_
   bar.maxUnits=maxU;bar.minUnits=minU;bar.digitsOnly=digits;bar.disabled=dis;
   NSTextField *label=[NSTextField labelWithString:prompt];label.font=[NSFont systemFontOfSize:16 weight:NSFontWeightSemibold];
   label.textColor=NSColor.whiteColor;label.frame=NSMakeRect(18,h-36,w-36,22);label.lineBreakMode=NSLineBreakByTruncatingTail;
-  NSString *limit=maxU>0?[NSString stringWithFormat:@(TOTK_UI("最多 %d 个字 · ","Up to %d characters · ")),maxU]:@"";
-  NSTextField *hint=[NSTextField labelWithString:[NSString stringWithFormat:@(TOTK_UI("%@用键盘输入，回车确定，Esc 取消","%@Type with the keyboard, Return to confirm, Esc to cancel")),limit]];
+  NSString *limit=maxU>0?[NSString stringWithFormat:@(TOTK_UI("最多 %d 个字 · ","Up to %d characters · ","máx. %d caracteres · ")),maxU]:@"";
+  NSTextField *hint=[NSTextField labelWithString:[NSString stringWithFormat:@(TOTK_UI("%@用键盘输入，回车确定，Esc 取消","%@Type with the keyboard, Return to confirm, Esc to cancel","%@digite no teclado, Enter confirma, Esc cancela")),limit]];
   hint.font=[NSFont systemFontOfSize:12];hint.textColor=[NSColor colorWithCalibratedWhite:0.72 alpha:1];hint.alignment=NSTextAlignmentRight;
   hint.frame=NSMakeRect(18,h-36,w-36,20);hint.autoresizingMask=NSViewWidthSizable;
   NSTextField *field=secure?[[NSSecureTextField alloc] initWithFrame:NSMakeRect(18,16,w-36,34)]:[[NSTextField alloc] initWithFrame:NSMakeRect(18,16,w-36,34)];
