@@ -497,7 +497,7 @@ static void keepalive_start(void) {
 }
 void mtl_init(void) {
     if (g_dev) return;
-    if (runtime_boot_status) runtime_boot_status(TOTK_UI("创建 Metal 图形设备","Creating the Metal device"),TOTK_UI("准备 GPU、命令队列和图形资源","Preparing the GPU, command queues and graphics resources"));
+    if (runtime_boot_status) runtime_boot_status(TOTK_UI("创建 Metal 图形设备","Creating the Metal device","Criando o dispositivo Metal"),TOTK_UI("准备 GPU、命令队列和图形资源","Preparing the GPU, command queues and graphics resources","Preparando a GPU, as filas de comando e os recursos gráficos"));
     g_present_probe = getenv("DM_PRESENT_PROBE") != NULL;
     const char *link = getenv("DM_PRESENT_LINK");
     g_dm_present_link = link ? atoi(link) : 1; if (g_dm_present_link < 0 || g_dm_present_link > 2) g_dm_present_link = 1;   // 缺省 1（真机同进程交替：负载超一拍时长帧 15% → 0、帧间隔变匀；稳 60 时与 0 无差别）；DM_PRESENT_LINK=0 关   // 1 = 60 Hz 节拍每拍出图；2 = 120 Hz 节拍、游戏隔拍出一帧（落后时下一个 8.33 ms 拍就能上屏） | Default 1 (real-device same-process alternation: when load exceeds one display-link period, long frames 15% → 0 and frame intervals even out; no difference from 0 at a steady 60); DM_PRESENT_LINK=0 turns it off   // 1 = present on every tick of a 60 Hz display link; 2 = 120 Hz display link, the game presents a frame every other display-link tick (when behind, it can present on the next 8.33 ms display-link tick)
@@ -4614,7 +4614,7 @@ static NSString *exe_rel(const char *rel) {
 // Shader mapping table (output of tools/shader_map.py): at runtime only 'Switch control section key → stage' is used; shaders are always translations of the Switch originals (tools/dmsh_build.py produces <key>_b.metallib + reflection offline)
 static void shmap_load(void) {
     if (g_shmap) return;
-    if (runtime_boot_status) runtime_boot_status(TOTK_UI("准备着色器缓存","Preparing the shader cache"),TOTK_UI("检查本机缓存并读取着色器清单","Checking the local cache and reading the shader lists"));
+    if (runtime_boot_status) runtime_boot_status(TOTK_UI("准备着色器缓存","Preparing the shader cache","Preparando o cache de shaders"),TOTK_UI("检查本机缓存并读取着色器清单","Checking the local cache and reading the shader lists","Checando o cache local e lendo as listas de shaders"));
     const char *e = getenv("DM_NVN_SHMAP");
     NSString *path = e ? @(e) : exe_rel("shader-map.tsv");
     NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
