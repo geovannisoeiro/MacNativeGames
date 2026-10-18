@@ -924,7 +924,10 @@ def step_app(tree, out, logs, *, version="v0", game='totk'):
                 GCSupportsControllerUserInteraction=True,
                 # Pin the picture to the game's own 1920x1080 for good: no 2560x1440 swapchain or
                 # DynamicTextureAllocator heap is prepared, so key 3 has nothing to switch to.
-                LSEnvironment=dict(TOTK_OUTPUT_RES='0'))
+                # And ask for the host's own text in Portuguese: this Mac's first language preference is
+                # English (Brazil) with Portuguese second, so the ordered-list detection alone would answer
+                # English. Drop this line to follow the system preference instead.
+                LSEnvironment=dict(TOTK_OUTPUT_RES='0', TOTK_UI_LANG='pt'))
     icon = tree / 'build/AppIcon.icns'
     if icon.exists():
         clone(icon, tmp / 'Contents/Resources/AppIcon.icns')
