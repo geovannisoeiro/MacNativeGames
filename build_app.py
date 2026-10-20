@@ -1331,12 +1331,18 @@ def main(argv):
     # macOS scans a new app the first time it runs (minutes for 16 GB, with nothing on screen): run it once here, in its
     # check-only mode, so the player's first start is immediate.
     if args.platform=='macos':
+        # TOTK (2026-10-20): o warm do Metal tem de vir ANTES do --check. Ele mete e tira um
+        # ficheiro de dentro do bundle assinado (o warm-metal-cache, que a assinatura sela e
+        # que portanto nao pode ficar la), e um bundle cujo conteudo muda depois de verificado
+        # volta a ser verificado pelo macOS no launch seguinte -- os 16 GB, com o jogo parado
+        # no ecra preto. Com o warm antes, o --check ve o conteudo final e o primeiro launch
+        # do dono e imediato. Medido: 6+ minutos de espera com o scan a correr por baixo.
+        step_warm_metal(tree, out, logs)
         say('4/4 app: macOS checks the new app once (a few minutes for the 16 GB bundle)')
         t1 = time.time()
         r = subprocess.run([out / 'Contents/MacOS/TOTK', '--check'], capture_output=True, text=True, timeout=1800)
         if r.returncode: raise BuildError(f'the app does not start: {(r.stdout + r.stderr).strip()}')
         say(f'   checked in {time.time() - t1:.0f} s')
-        step_warm_metal(tree, out, logs)
     say(f'done in {(time.time() - t0) / 60:.0f} min: {out}')
     if args.platform=='macos':
         say('Open it from Finder. Moving it afterwards (also to /Applications) keeps the macOS check when it stays on the same '
