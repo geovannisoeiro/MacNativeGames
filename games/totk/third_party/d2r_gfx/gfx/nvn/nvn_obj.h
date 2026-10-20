@@ -297,6 +297,9 @@ void mtl_texels_stats(uint64_t *calls, uint64_t *region, uint64_t *lin, uint64_t
 // TOTK (2026-10-20): the split of the CPU texel-write round trip, in nanoseconds: the pool->linear half, the
 // linear->pool half, the allocator pair (malloc+free of the level buffer) and the region's own copy.
 void mtl_texels_split_ns(uint64_t *desw_ns, uint64_t *swiz_ns, uint64_t *alloc_ns, uint64_t *copy_ns);
+// TOTK (2026-10-20): the in-game identity check of the direct region write (TOTK_GOB_VERIFY): how many
+// writes were compared against the round trip's result on the real pool, and how many differed.
+void mtl_texels_gob_stats(uint64_t *verified, uint64_t *mismatch);
 // CPU 读贴图：level / layer0 起，按 row / img 字节步长写进 dst
 // CPU texture read: starting at level / layer0, written into dst with row / img byte strides
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img);
