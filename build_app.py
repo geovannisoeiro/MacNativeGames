@@ -1348,7 +1348,22 @@ def main(argv):
         step_warm_metal(tree, out, logs)
         say('4/4 app: macOS checks the new app once (a few minutes for the 16 GB bundle)')
         t1 = time.time()
-        r = subprocess.run([out / 'Contents/MacOS/TOTK', '--check'], capture_output=True, text=True, timeout=1800)
+        # TOTK (2026-10-20): o --check tem de ser feito COMO APP, nao como exec directo. A
+        # validacao do bundle selado (17 GB de dados do jogo) so e feita quando o macOS lanca a
+        # app pela LaunchServices; um exec directo do binario valida so o binario e deixa a
+        # validacao para o proximo lancamento do dono -- que e exactamente os "6+ minutos de ecra
+        # preto" (medido: o processo fica preso em _dyld_start, com o XprotectService a 87% de CPU).
+        # Lancado como app, o OS paga a validacao aqui, durante o build.
+        marker = logs / 'check-app.txt'
+        if marker.exists(): marker.unlink()
+        env = {**os.environ, 'TOTK_CHECK_MARKER': str(marker)}
+        subprocess.run(['open', '--args', '--check', str(out)], env=env, check=False)
+        deadline = time.time() + 1800
+        while time.time() < deadline and not marker.exists():
+            time.sleep(2)
+        if not marker.exists():
+            raise BuildError('the app did not answer the check (no marker); the bundle could not be validated')
+        r = subprocess.run(['cat', str(marker)], capture_output=True, text=True)
         if r.returncode: raise BuildError(f'the app does not start: {(r.stdout + r.stderr).strip()}')
         say(f'   checked in {time.time() - t1:.0f} s')
     say(f'done in {(time.time() - t0) / 60:.0f} min: {out}')
