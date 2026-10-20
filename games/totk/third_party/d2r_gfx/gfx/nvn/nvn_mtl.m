@@ -10346,9 +10346,32 @@ static int wt_direct_on(void) {   // TOTK (2026-10-20): o interruptor do probe (
     return on;
 }
 static _Atomic uint64_t g_gob_match, g_gob_mismatch;   // TOTK (2026-10-20): a verificacao dentro do jogo
-static int wt_verify_on(void) {   // TOTK (2026-10-20): a identidade da escrita directa, medida no pool real
-    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_GOB_VERIFY"); on = e && *e && strcmp(e, "0"); }
-    return on;
+static int wt_verify_n(void) {   // TOTK (2026-10-20): quantas escritas se verificam por (formato, target)
+    static int n = -1; if (n < 0) { const char *e = getenv("TOTK_GOB_VERIFY"); n = e ? atoi(e) : 0; }
+    return n > 0 ? n : 0;
+}
+// TOTK (2026-10-20): a verificacao e AMOSTRADA. Verificar todas as escritas tornaria a run inutil
+// (o custo da verificacao dominaria o custo medido, e o "pos" deixaria de medir a escrita directa).
+// O objectivo e cobrir os layouts (comprimido, 3D, array/cubemap), nao contar: as primeiras n de
+// cada (formato, target). Uma tabela linearly searched com colisoes toleradas chega: sao poucas
+// dezenas de pares (formato, target).
+static int wt_verify_slot(int format, int target) {
+    static struct { int fmt, tgt, n; } tab[64];
+    static int used;
+    int want = wt_verify_n();
+    if (!want) return -1;
+    for (int i = 0; i < used; i++)
+        if (tab[i].fmt == format && tab[i].tgt == target) {
+            if (tab[i].n >= want) return -1;
+            tab[i].n++; return i;
+        }
+    if (used >= 64) return -1;
+    tab[used].fmt = format; tab[used].tgt = target; tab[used].n = 1;
+    return used++;
+}
+void mtl_texels_gob_stats(uint64_t *verified, uint64_t *mismatch) {
+    if (verified) *verified = atomic_load(&g_gob_match) + atomic_load(&g_gob_mismatch);
+    if (mismatch) *mismatch = atomic_load(&g_gob_mismatch);
 }
 void mtl_texels_stats(uint64_t *calls, uint64_t *region, uint64_t *lin, uint64_t *gob, uint64_t *gobcalls) {
     if (calls) *calls = atomic_load(&g_wt_calls);
@@ -10405,9 +10428,10 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
         // It costs a copy of the texture and a full round trip per call, so it is a diagnostic
         // (TOTK_GOB_VERIFY=1) and never the default.
         uint8_t *verify_copy = NULL;
-        if (direct && wt_verify_on()) {
+        if (direct && wt_verify_slot((int)t->d.format, t->d.target) >= 0) {
             verify_copy = (uint8_t *)malloc(t->L.size);
             if (verify_copy) memcpy(verify_copy, t->mem, t->L.size);   // BEFORE the write: the reference
+            else atomic_fetch_add(&g_gob_mismatch, 1);   // nao se pode verificar: conta como falha
         }
         for (int z = 0; z < nz; z++) {
             unsigned layer = is3d ? 0 : layer0 + r->zoffset + z;
