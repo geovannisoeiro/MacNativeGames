@@ -36,13 +36,35 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <mach/mach.h>
+#include <mach/task_info.h>
 #include <TargetConditionals.h>
 #include <unistd.h>
 #if TARGET_OS_OSX
-#define DM_MEM_CAP_DEFAULT_GB 24
+/* Memory watchdog cap. The fixed 24 GB was unreachable on an 8 GB Mac, so the watchdog could
+   never fire: dead code that only looked like a safety net. The cap is now relative to the
+   machine's RAM — 3/4 of it, so 6 GB on an 8 GB Mac. DM_MEM_CAP_GB overrides it with an absolute
+   value in GB; DM_MEM_CAP_GB=0 disables the cap, as on iOS. */
+#define DM_MEM_CAP_RAM_NUM 3
+#define DM_MEM_CAP_RAM_DEN 4
+#define DM_MEM_CAP_FALLBACK_GB 24   // hw.memsize unreadable: keep the old (unreachable) cap rather than guessing
 #else
 #define DM_MEM_CAP_DEFAULT_GB 0
 #endif
+#include <sys/sysctl.h>
+/* The watchdog cap in GB. Relative to the machine's RAM by default; hw.memsize is the same
+   source the port already uses for the GPU memory budget (nvn_mtl.m:290). */
+static long dm_mem_cap_gb(void) {
+    const char *e = getenv("DM_MEM_CAP_GB");
+    if (e) return atol(e);
+#if TARGET_OS_OSX
+    uint64_t phys = 0; size_t n = sizeof phys;
+    if (!sysctlbyname("hw.memsize", &phys, &n, NULL, 0) && phys)
+        return (long)(phys / (1024ull * 1024ull * 1024ull) * DM_MEM_CAP_RAM_NUM / DM_MEM_CAP_RAM_DEN);
+    return DM_MEM_CAP_FALLBACK_GB;
+#else
+    return DM_MEM_CAP_DEFAULT_GB;
+#endif
+}
 #include <pthread/qos.h>
 #include <sys/resource.h>
 #include <mach/thread_policy.h>
@@ -479,6 +501,7 @@ NVN(nvnTextureReadTexels, void, const NVNtexture *t, const NVNtextureView *v, co
 NVN(nvnTextureReadTexelsStrided, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst, ptrdiff_t row, ptrdiff_t img) {
     read_texels(CTX(t), (const view_t *)v, r, dst, row, img);
 }
+static _Atomic uint64_t g_texels_ns;   // TOTK (2026-10-20): time inside mtl_write_texels, per frame
 static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, ptrdiff_t row, ptrdiff_t img) {
     int bw, bh, bpb = nvn_fmt_bpb(o->d.format, &bw, &bh);
     uint32_t wb = (uint32_t)((r->width + bw - 1) / bw) * bpb, hb = (uint32_t)(r->height + bh - 1) / bh;
@@ -487,7 +510,12 @@ static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r
     if (row < (ptrdiff_t)wb || img < row * (ptrdiff_t)hb) die("WriteTexels: stride smaller than region");
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
     if (v && v->set_format && v->format != o->d.format) die("WriteTexels: format-reinterpreting view not supported");
-    x_drain(); mtl_write_texels(o, level, layer0, r, src, (size_t)row, (size_t)img);
+    x_drain();
+    {   // TOTK (2026-10-20): the time inside the texel write, so it can be told apart from the re-upload
+        uint64_t w0 = now_ns();
+        mtl_write_texels(o, level, layer0, r, src, (size_t)row, (size_t)img);
+        atomic_fetch_add(&g_texels_ns, now_ns() - w0);
+    }
 }
 NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src) {
     write_texels(CTX(t), (const view_t *)v, r, src, 0, 0);
@@ -2362,6 +2390,15 @@ extern uint32_t mtl_present_qos(void);
 uint64_t g_frame_pub;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出图队列归还的累计，出图时按帧记（一帧内可有多次取图） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
+// TOTK (2026-10-20): the fallback sleep is bounded. `at` is when the texture becomes available, and it can be
+// far in the future: the present pacer advances its target by one period per frame, so a frame that finishes
+// early (a light scene) makes that target run ahead without bound — measured 182 s ahead after 35k frames.
+// Sleeping until `at` would then be a sleep of MINUTES, for a single missed display-link tick. Two periods is
+// enough to cover a late tick and nothing more: the phase that accumulated is not waited for.
+static inline uint64_t texels_sleep_deadline(uint64_t at, uint64_t now, uint64_t period) {
+    uint64_t cap = now + 2 * (period ? period : 33333333ull);
+    return at < cap ? at : cap;
+}
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     NVN_BLOCKING();
@@ -2375,8 +2412,8 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         static uint64_t rt_period; uint64_t period = present_period(o);
         if (period && rt_period != period) { rt_period = period; set_time_constraint(period); }
         rt_comp_tick(period);
-        if (mtl_link_active() && !uncapped_now() && !mfx_own_clock()) { if (!mtl_link_wait_tick(period ? 2 * period : 33333333ull, present_ticks(o)) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK：节拍完全跟显示节拍（跑得快就等下一拍，落后立刻走）；自己的 60 Hz 时钟只作等不到节拍时的兜底 | DM_PRESENT_LINK: pacing fully follows the display link (wait for the next display-link tick when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
-        else if (wait) sleep_until_ns(at);
+        if (mtl_link_active() && !uncapped_now() && !mfx_own_clock()) { if (!mtl_link_wait_tick(period ? 2 * period : 33333333ull, present_ticks(o)) && wait) sleep_until_ns(texels_sleep_deadline(at, now, period)); }   // DM_PRESENT_LINK：节拍完全跟显示节拍（跑得快就等下一拍，落后立刻走）；自己的 60 Hz 时钟只作等不到节拍时的兜底 | DM_PRESENT_LINK: pacing fully follows the display link (wait for the next display-link tick when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
+        else if (wait) sleep_until_ns(texels_sleep_deadline(at, now, period));
     } else {   // DM_DETCLOCK_PACE=1（画面闸门用）：客体时钟按帧走的同时，每帧墙钟不短于一个步长——帧数与游戏内时间确定，后台加载线程每帧至少有一个步长的墙钟可用； | DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
                // 机器满载时帧只会更慢、后台得到的墙钟只会更多，所以「消息后第 N 帧」截到的画面与负载无关
                // When the machine is fully loaded frames only get slower and the background only gets more wall clock, so the picture captured at "the Nth frame after the message" is independent of load
@@ -2456,8 +2493,26 @@ static void dump_frame(void) {
     // drags the whole machine into a kernel panic, which happened twice with other programs on the same machine), or set for tests with DM_MEM_CAP_GB=<integer>; the player's iOS app has no cap (exiting before the system kills it is pointless and only adds another kind of crash)
     if (g_frame % 300 == 0) { task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
         if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS) { unsigned long long mb = (unsigned long long)(vi.phys_footprint >> 20); void mtl_mem_stat(unsigned long long, unsigned long long); mtl_mem_stat(g_frame, mb);
-            static long cap = -1; if (cap < 0) { const char *e = getenv("DM_MEM_CAP_GB"); cap = e ? atol(e) : DM_MEM_CAP_DEFAULT_GB; }
-            if (cap > 0 && mb > (unsigned long long)cap * 1024) { LOG("【红】内存看门狗：常驻 %llu MB 超过上限 %ld GB（帧 %llu），自行退出", mb, cap, (unsigned long long)g_frame); _exit(86); } } }
+            static long cap = -1; if (cap < 0) cap = dm_mem_cap_gb();
+            if (cap > 0 && mb > (unsigned long long)cap * 1024) {
+                /* Degrade before exiting, and the order is the point. Give the allocator's free
+                   pages back first (cheap, no lifetime risk), then let the port release what it
+                   can (the pooled upload staging that is not in flight), then re-read the
+                   footprint. Exit only if it is still over after several consecutive checks, so
+                   one spike does not kill the game — and a death with 20 GB of headroom left is
+                   the worst possible reaction, which is what the old fixed cap would have done
+                   on a machine big enough to reach it. */
+                static int over;
+                over++;
+                malloc_zone_pressure_relief(malloc_default_zone(), 0);
+                void mtl_mem_relief(void); mtl_mem_relief();
+                task_vm_info_data_t vi2; mach_msg_type_number_t c2 = TASK_VM_INFO_COUNT;
+                unsigned long long mb2 = mb;
+                if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi2, &c2) == KERN_SUCCESS) mb2 = (unsigned long long)(vi2.phys_footprint >> 20);
+                if (mb2 <= (unsigned long long)cap * 1024) { LOG("【黄】内存看门狗：常驻 %llu MB 超过上限 %ld GB（帧 %llu），缓解到 %llu MB", mb, cap, (unsigned long long)g_frame, mb2); over = 0; }
+                else if (over >= 3) { LOG("【红】内存看门狗：常驻 %llu MB 超过上限 %ld GB（帧 %llu），缓解后仍为 %llu MB，自行退出", mb, cap, (unsigned long long)g_frame, mb2); _exit(86); }
+                else LOG("【黄】内存看门狗：常驻 %llu MB 超过上限 %ld GB（帧 %llu），已缓解（第 %d 次）", mb, cap, (unsigned long long)g_frame, over);
+            } } }
     dm_guest_frame_tick();   // 确定性客体时钟（DM_DETCLOCK，宿主 hle_os.c）：每次出图推进固定步长；未开为空操作 | Deterministic guest clock (DM_DETCLOCK, host hle_os.c): each present advances a fixed step; a no-op when not enabled
 }
 // ---------- 计时埋点（逐帧行写进 DM_NVN_TSV：frame / @指标 / 值；每 300 帧汇总 p50 / p95 / 最大） ----------
@@ -2851,6 +2906,20 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             struct rusage ru; getrusage(RUSAGE_SELF, &ru);
             uint64_t pc = (uint64_t)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000000000ull + (uint64_t)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) * 1000ull;
             if (pproc) trow(f, "@proc_cpu_ms", (pc - pproc) / 1e6); pproc = pc;
+            {   // TOTK (2026-10-20): page faults of the process. ru_minflt/ru_majflt only exist with
+                // __DARWIN_C_FULL (the build uses -std=gnu11; do not define _POSIX_C_SOURCE here). ru_majflt counts
+                // disk page-ins on Darwin, and task_events_info.pageins is the native counter for those.
+                static long pminflt, pmajflt, ppageins, pcow, pcsw;
+                trow(f, "@minflt", (double)(ru.ru_minflt - pminflt));
+                trow(f, "@majflt", (double)(ru.ru_majflt - pmajflt));
+                pminflt = ru.ru_minflt; pmajflt = ru.ru_majflt;
+                struct task_events_info tei; mach_msg_type_number_t tecn = TASK_EVENTS_INFO_COUNT;
+                if (task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&tei, &tecn) == KERN_SUCCESS && tecn >= TASK_EVENTS_INFO_COUNT) {
+                    trow(f, "@pageins", (double)(tei.pageins - ppageins)); ppageins = tei.pageins;
+                    trow(f, "@cow_faults", (double)(tei.cow_faults - pcow)); pcow = tei.cow_faults;
+                    trow(f, "@csw", (double)(tei.csw - pcsw)); pcsw = tei.csw;
+                }
+            }
             trow(f, "@call_ms", (t0 - g_t0_ns) / 1e6);
         }
         trow(f, "@passes", (double)(ps - prev_pass)); trow(f, "@draws", (double)(dr - prev_draw));
@@ -2865,6 +2934,20 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         trow(f, "@use_call", (double)(uc_ - puc)); trow(f, "@use_skip", (double)(us_ - pus)); puc = uc_; pus = us_;
         static uint64_t pfa, pre_; uint64_t fa_, pr_, up_, re_; nvn_dirty_stats(&fa_, &pr_); mtl_pkg_stats(&up_, &re_);
         trow(f, "@faults", (double)(fa_ - pfa)); trow(f, "@reuploads", (double)(re_ - pre_)); pfa = fa_; pre_ = re_;
+        {   // TOTK (2026-10-20): the texel-write path per frame. The level is in two units because they are
+            // different quantities: the linear bytes the round trip copies, and the block-linear bytes it touches
+            // in the pool. The gap between them is the dispersion that makes it slow. @wt_gob_calls separates the
+            // textures that took move()'s GOB branch from the linear ones, whose round trip is already cheap.
+            uint64_t wc, wr, wl, wg, wgc; mtl_texels_stats(&wc, &wr, &wl, &wg, &wgc);
+            static uint64_t pwc, pwr, pwl, pwg, pgg;
+            trow(f, "@texels_us", (double)atomic_exchange(&g_texels_ns, 0) / 1e3);
+            trow(f, "@wt_calls", (double)(wc - pwc));
+            trow(f, "@wt_region_mb", (double)(wr - pwr) / 1048576.0);
+            trow(f, "@wt_level_lin_mb", (double)(wl - pwl) / 1048576.0);
+            trow(f, "@wt_level_gob_mb", (double)(wg - pwg) / 1048576.0);
+            trow(f, "@wt_gob_calls", (double)(wgc - pgg));
+            pwc = wc; pwr = wr; pwl = wl; pwg = wg; pgg = wgc;
+        }
         static uint64_t pmc, pmp, pmn; uint64_t mc_, mpg_, mn_; nvn_dirty_mp_stats(&mc_, &mpg_, &mn_);
         trow(f, "@mprotect_calls", (double)(mc_ - pmc)); trow(f, "@mprotect_pages", (double)(mpg_ - pmp)); trow(f, "@mprotect_ms", (mn_ - pmn) / 1e6); pmc = mc_; pmp = mpg_; pmn = mn_;
         double up_ms = mtl_upload_ns_take() / 1e6; trow(f, "@upload_ms", up_ms);
@@ -2875,6 +2958,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         trow(f, "@lib_new", (double)(lib_ - plib)); trow(f, "@pso_new", (double)(pso_ - ppso));
         {   // 长帧日志：本帧各项先记进环，等 8 帧后 GPU 时间到了再决定打不打（见下） | long-frame log: this frame's items are first recorded into the ring; whether to print is decided 8 frames later, once the GPU time has arrived (see below)
             static uint64_t plns, ppns, pup, prup, pub; uint64_t lns, pns, up, rup, ub; mtl_create_ns(&lns, &pns); mtl_pkg_stats(&up, &rup); ub = mtl_upload_bytes();
+            trow(f, "@make_ms", ((lns - plns) + (pns - ppns)) / 1e6);   // TOTK (2026-10-20): time creating libraries/pipelines synchronously this frame
             lf_rec *r = &g_lf[f % LFN]; r->f = f; r->fr = fr; r->nv = nv; r->ls = g_nvn_loadscreen_up ? g_nvn_loadscreen_up() : 0; r->t_s = (now_ns() - g_t0_ns) / 1e9; r->pso = (unsigned)(pso_ - ppso); r->lib = (unsigned)(lib_ - plib);
             r->make_ms = ((lns - plns) + (pns - ppns)) / 1e6; r->up = (unsigned)(up - pup); r->rup = (unsigned)(rup - prup); r->up_mb = (ub - pub) / 1048576.0; r->up_ms = up_ms;
             plns = lns; ppns = pns; pup = up; prup = rup; pub = ub;

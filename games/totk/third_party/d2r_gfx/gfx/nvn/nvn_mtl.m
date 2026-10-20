@@ -5235,6 +5235,31 @@ static void pkg_orphan_report(void) {
     MLOG("素材贴图副本 至提交 %llu：在册 %zu 个 / %llu MB，其中所在内存池已删 %llu 个 / %llu MB", (unsigned long long)g_sub_serial, n, (unsigned long long)(total >> 20),
          (unsigned long long)orphan_n, (unsigned long long)(orphan_b >> 20));
 }
+/* Memory relief for the watchdog (hle_nvn.c): give back the pooled upload staging that is NOT
+   in flight. A block that is busy is held by its command buffer until the GPU completes it, so
+   only the free ones are released, and the pool is append-only, so the release walks the tail.
+   The residency tracking uses weak tables, so dropping the strong reference is what takes the
+   block out of the set. */
+void mtl_mem_relief(void) {
+    size_t freed = 0;
+    for (int i = g_up_pool_n - 1; i >= 0; i--) {
+        if (atomic_load(&g_up_pool_busy[i])) break;   // in flight: the tail above it is what may go
+        id<MTLBuffer> b = g_up_pool[i];
+        if (!b) continue;
+        freed += b.allocatedSize;
+        g_up_pool[i] = nil;
+        g_up_pool_n = i;
+    }
+    for (int i = g_up_spool_n - 1; i >= 0; i--) {
+        if (atomic_load(&g_up_spool_busy[i])) break;
+        id<MTLBuffer> b = g_up_spool[i];
+        if (!b) continue;
+        freed += b.allocatedSize;
+        g_up_spool[i] = nil;
+        g_up_spool_n = i;
+    }
+    if (freed) MLOG("内存缓解：释放上传暂存池 %zu MB", freed / (1024 * 1024));
+}
 static void pkg_evict_sweep(void) {
     static int mode = -1; static uint64_t budget, low, high, crit;
     if (mode < 0) {
@@ -6632,9 +6657,13 @@ static void warm_start(void) {
         // 8,290 prepared shaders first the title came after 7-8 s even with warm caches and after about 10 minutes on a
         // Mac whose Metal cache has never seen them. Without the title list the game's manifest goes first, as before.
         if ([fm fileExistsAtPath:title]) [all addObject:title];
-        if ([fm fileExistsAtPath:seed]) [all addObject:seed];
+        // TOTK (2026-10-20): the user's own list comes right after the title list, before the app's manifest
+        // and the prepared shaders. It holds the pipelines THIS machine has already met, and a pipeline met for
+        // the first time is compiled synchronously on the submit thread — measured 178 ms, with the GPU idle 97%
+        // of the frame. The title list stays first because the first frame waits for it.
         NSString *user = pso_user_path();
         if (user && [fm fileExistsAtPath:user]) [all addObject:user];
+        if ([fm fileExistsAtPath:seed]) [all addObject:seed];
         NSString *shared = pso_shared_path();   // what every session collected (pso_user_record)
         if ([fm fileExistsAtPath:shared]) [all addObject:shared];
         // The selected version's prepared shaders (real MSL, also on a fresh install) come last: they are shader libraries
@@ -10230,6 +10259,21 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
 }
 // TOTK: CPU texture write (WriteTexels), mirroring mtl_read_texels: packaged textures update pool memory in
 // block-linear layout (dirty tracking re-uploads it); other textures are written into the MTLTexture by blit.
+// TOTK (2026-10-20): per-frame counters for the texel-write path, so one WriteTexels call can be told
+// apart from the re-upload and from the pipeline compile. The level is reported in TWO units because
+// they are different quantities: the linear bytes the round trip copies, and the block-linear (GOB)
+// bytes it touches in the pool. The dispersed access is what makes it slow, and the gap between the
+// two IS the dispersion factor. A linear texture takes the cheap branch of move() (a memcpy per row,
+// no 16-byte segments) and has no GOB footprint at all, so the two are counted apart: mixing them
+// would average two incomparable costs.
+static _Atomic uint64_t g_wt_calls, g_wt_region_b, g_wt_level_lin_b, g_wt_level_gob_b, g_wt_gob_calls;
+void mtl_texels_stats(uint64_t *calls, uint64_t *region, uint64_t *lin, uint64_t *gob, uint64_t *gobcalls) {
+    if (calls) *calls = atomic_load(&g_wt_calls);
+    if (region) *region = atomic_load(&g_wt_region_b);
+    if (lin) *lin = atomic_load(&g_wt_level_lin_b);
+    if (gob) *gob = atomic_load(&g_wt_level_gob_b);
+    if (gobcalls) *gobcalls = atomic_load(&g_wt_gob_calls);
+}
 void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb) die("WriteTexels: unknown format %d", t->d.format);
@@ -10245,6 +10289,17 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
         uint8_t *lin = malloc(lp * lr * lz);
         if (!lin) die("WriteTexels: out of memory");
         dm_guest_write_prepare(t->mem, t->L.size);
+        {   // TOTK (2026-10-20): what this call moves. The GOB span of the level is the difference of
+            // two level offsets (the tile shrinks per level, and the last level's delta is the layer total);
+            // it is 0 for a linear texture, a buffer or an unknown format, which is exactly the set that
+            // takes move()'s cheap branch.
+            uint64_t lo = nvn_tex_level_offset(&t->d, level), hi = nvn_tex_level_offset(&t->d, level + 1);
+            int is_lin = nvn_tex_is_linear(&t->d);
+            atomic_fetch_add(&g_wt_calls, 1);
+            atomic_fetch_add(&g_wt_region_b, (uint64_t)wb * hb * nz);
+            atomic_fetch_add(&g_wt_level_lin_b, (uint64_t)lp * lr * lz);
+            if (!is_lin && hi > lo) { atomic_fetch_add(&g_wt_level_gob_b, hi - lo); atomic_fetch_add(&g_wt_gob_calls, 1); }
+        }
         for (int z = 0; z < nz; z++) {
             unsigned layer = is3d ? 0 : layer0 + r->zoffset + z;
             if ((is3d && z == 0) || !is3d) if (nvn_deswizzle(&t->d, level, layer, t->mem, lin, lp)) die("WriteTexels: unsupported layout");
