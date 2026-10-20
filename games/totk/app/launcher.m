@@ -129,22 +129,25 @@ static void contrib_reminder(NSString *path) {
     NSString *gh = gh_path();
     [NSApplication sharedApplication]; [NSApp activateIgnoringOtherApps:YES];
     NSAlert *alert = [NSAlert new];
-    alert.messageText = @(TOTK_UI("期待你的贡献", "We would love your contribution"));
+    alert.messageText = @(TOTK_UI("期待你的贡献", "We would love your contribution", "Gostaríamos da sua contribuição"));
     alert.informativeText = [NSString stringWithFormat:@"%@%@", [NSString stringWithFormat:@(TOTK_UI("你有 %lu 个着色器可以贡献：玩的时候遇到的、公共着色器清单里还没有的。它们记在一个小文件里，只有着色器的标识，不含游戏内容、存档或个人信息。把它发到 GitHub 加进公共清单，以后大家打包的 App 都会带上它们，玩到那里不再卡顿。\n\n",
-                                      "You have %lu shaders to contribute: ones your game met that the shared shader list does not have yet. They are kept in a small file with shader identifiers only: no game data, saves or personal information. Sent to GitHub and added to the shared list, they come with everyone's next build, and nobody stutters there again.\n\n")), (unsigned long)rows],
+                                      "You have %lu shaders to contribute: ones your game met that the shared shader list does not have yet. They are kept in a small file with shader identifiers only: no game data, saves or personal information. Sent to GitHub and added to the shared list, they come with everyone's next build, and nobody stutters there again.\n\n",
+                                      "Você tem %lu shaders para contribuir: os que o jogo encontrou e a lista pública de shaders ainda não tem. Eles ficam num arquivo pequeno, só com os identificadores do shader: nada do jogo, dos saves ou dados pessoais. Enviados ao GitHub e somados à lista, vêm no build seguinte de todo mundo, e ninguém trava mais ali.\n\n")), (unsigned long)rows],
                              gh ? @(TOTK_UI("点“自动提交”会用这台 Mac 上登录的 GitHub 命令行（gh）直接提交，不用打开网页。点“发送”会打开 GitHub 的提交页面，并在访达里显示这个文件，把它拖进页面即可。",
-                                            "\"Submit automatically\" sends it now with the GitHub CLI (gh) signed in on this Mac, without the browser. \"Send\" opens the GitHub form and shows the file in Finder: drag it into the form."))
+                                            "\"Submit automatically\" sends it now with the GitHub CLI (gh) signed in on this Mac, without the browser. \"Send\" opens the GitHub form and shows the file in Finder: drag it into the form.",
+                                            "\"Enviar automaticamente\" submite agora com a linha de comando do GitHub (gh) autenticada neste Mac, sem abrir o navegador. \"Enviar\" abre o formulário do GitHub e mostra o arquivo no Finder: arraste-o para o formulário."))
                                 : @(TOTK_UI("点“发送”会打开 GitHub 的提交页面，并在访达里显示这个文件，把它拖进页面即可。",
-                                            "\"Send\" opens the GitHub form and shows the file in Finder: drag it into the form."))];
-    [alert addButtonWithTitle:@(TOTK_UI("发送", "Send"))];
-    [alert addButtonWithTitle:gh ? @(TOTK_UI("自动提交", "Submit automatically")) : @(TOTK_UI("下次提醒", "Remind me next time"))];
-    [alert addButtonWithTitle:@(TOTK_UI("不要提醒了", "Don't remind me again"))];
+                                            "\"Send\" opens the GitHub form and shows the file in Finder: drag it into the form.",
+                                            "\"Enviar\" abre o formulário do GitHub e mostra o arquivo no Finder: arraste-o para o formulário."))];
+    [alert addButtonWithTitle:@(TOTK_UI("发送", "Send", "Enviar"))];
+    [alert addButtonWithTitle:gh ? @(TOTK_UI("自动提交", "Submit automatically", "Enviar automaticamente")) : @(TOTK_UI("下次提醒", "Remind me next time", "Lembrar na próxima vez"))];
+    [alert addButtonWithTitle:@(TOTK_UI("不要提醒了", "Don't remind me again", "Não lembrar mais"))];
     NSModalResponse choice = [alert runModal];
     if (choice == NSAlertThirdButtonReturn) totk_contrib_never(path);
     if (choice == NSAlertSecondButtonReturn && gh) {
         NSString *issue = contrib_submit(gh, path, rows);
-        if (issue) { note([NSString stringWithFormat:@"%@\n%@", @(TOTK_UI("感谢你的 shader 贡献，让我们一起让游戏更流畅！", "Thank you for your shader contribution! Let's make the game smoother together!")), issue]); return; }
-        note(@(TOTK_UI("自动提交没有成功，改为打开提交页面。", "Submitting automatically did not work; opening the form instead.")));
+        if (issue) { note([NSString stringWithFormat:@"%@\n%@", @(TOTK_UI("感谢你的 shader 贡献，让我们一起让游戏更流畅！", "Thank you for your shader contribution! Let's make the game smoother together!", "Obrigado pela sua contribuição de shaders! Vamos deixar o jogo mais fluido.")), issue]); return; }
+        note(@(TOTK_UI("自动提交没有成功，改为打开提交页面。", "Submitting automatically did not work; opening the form instead.", "O envio automático não funcionou; abrindo o formulário.")));
         choice = NSAlertFirstButtonReturn;
     }
     if (choice != NSAlertFirstButtonReturn) return;
