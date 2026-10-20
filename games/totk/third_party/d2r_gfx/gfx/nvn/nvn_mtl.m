@@ -5872,6 +5872,8 @@ static os_unfair_lock g_fz_fn_lock = OS_UNFAIR_LOCK_INIT;
 static NSMutableDictionary<NSString *, id<MTLFunction>> *g_bf_fn_cache;
 static NSMutableDictionary<NSString *, id<MTLLibrary>> *g_bf_lib_cache;
 static nvn_hmap g_pso = {.klen = sizeof(pso_key)}, g_dss;
+// TOTK (2026-10-20): pipelines the game creates in play that need the sampler-border-colour variant.
+static _Atomic uint64_t g_pso_border;
 // TOTK: stages are translated separately, so a fragment shader may read user varyings the vertex shader never writes
 // (undefined values on the Switch GPU). Metal rejects such pairs; the vertex function gets the missing outputs added
 // (left zero) in a patched copy of its MSL, cached per missing set.
@@ -6432,7 +6434,19 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     }
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
     if (!ps) { static int said; if (said++ < 12) MLOG("【红】建渲染管线失败：%s（vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d）", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("【红】建渲染管线失败：后续不再逐条打印"); return nil; }
-    pso_key rk = k; rk.a2c &= ~PSO_VBORDER; if (bfn) rk.fsfn = NULL;   // the warm-up list records the plain pipeline: a border variant is built from the draw's samplers
+    // TOTK (2026-10-20): the border bit is KEPT in the recorded key. A draw that uses a sampler border
+    // colour needs a pipeline whose fragment function is the border-emulating one (fs_fn_border), and that
+    // function is chosen by a bit in the key -- so a warm-up that knew the bit could build exactly the
+    // pipeline the game will ask for. It could not, because the recording cleared the bit: the warm-up only
+    // ever built the plain pipeline, and the game rebuilt the border one in play (39.4 ms, GPU idle).
+    // fs_fn_border(fs, nodepth) is deterministic and cached per (fs, nodepth), so the warm-up computes the
+    // SAME function pointer the game will use, and the pipeline cache (which hashes the key, pointer
+    // included) finds it. A row recorded before this change has the bit clear and is simply the plain
+    // pipeline, as before: the border rows accumulate as the game meets them.
+    pso_key rk = k; if (bfn) rk.fsfn = NULL;
+    // TOTK (2026-10-20): how many of the pipelines the game builds in play need the border variant.
+    // It is the number that decides whether pre-warming them is worth the warm-up's time.
+    if (k.a2c & PSO_VBORDER) atomic_fetch_add(&g_pso_border, 1);
     pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&rk, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
     if (survey_shader_log()) MLOG("[survey-shader] frame %llu render pipeline %s in %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), shex, (bp_now() - bt) / 1e6);
     pso_record("R\t%s\n", shex);
@@ -6680,6 +6694,14 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                         if (sk.fz) {
                             if (sk.fz_desc.kind == 1 && fs) { int fx[32]; for (int i = 0; i < 32; i++) fx[i] = sk.fz_desc.fx[i]; fsfn = bf_fn(fs, fx, sk.fz_desc.fbmask, sk.k.lmap); }
                                                     if (!fsfn) { g_warm_skip_fz++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                        } else if ((sk.k.a2c & PSO_VBORDER) && fs && !sk.merged && !(sk.k.a2c >> 2 & 3)) {
+                            // TOTK (2026-10-20): the recorded key says this pipeline is the one with the
+                            // sampler-border-colour emulation. The game builds it with exactly this call, and
+                            // fs_fn_border caches per (fs, nodepth), so both get the same function pointer and
+                            // the pipeline cache (which hashes the key, pointer included) finds this one. If the
+                            // conditions do not match the game's, the game simply builds its own, as before --
+                            // the failure mode is benign.
+                            fsfn = fs_fn_border(fs, sk.k.dfmt == 0);
                         }
                         pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fsfn;
                         NSError *e = nil; uint64_t ps_started = bp_now();
@@ -10732,6 +10754,7 @@ static int wt_verify_slot(int format, int target) {
     tab[used].fmt = format; tab[used].tgt = target; tab[used].n = 1;
     return used++;
 }
+void mtl_pso_border_stats(uint64_t *border) { if (border) *border = atomic_load(&g_pso_border); }
 void mtl_texels_gob_stats(uint64_t *verified, uint64_t *mismatch) {
     if (verified) *verified = atomic_load(&g_gob_match) + atomic_load(&g_gob_mismatch);
     if (mismatch) *mismatch = atomic_load(&g_gob_mismatch);
