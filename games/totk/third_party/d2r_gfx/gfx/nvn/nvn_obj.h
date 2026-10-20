@@ -300,6 +300,8 @@ void mtl_texels_split_ns(uint64_t *desw_ns, uint64_t *swiz_ns, uint64_t *alloc_n
 // TOTK (2026-10-20): the in-game identity check of the direct region write (TOTK_GOB_VERIFY): how many
 // writes were compared against the round trip's result on the real pool, and how many differed.
 void mtl_texels_gob_stats(uint64_t *verified, uint64_t *mismatch);
+// TOTK (2026-10-20): pipelines the game created in play that need the sampler-border-colour variant.
+void mtl_pso_border_stats(uint64_t *border);
 // CPU 读贴图：level / layer0 起，按 row / img 字节步长写进 dst
 // CPU texture read: starting at level / layer0, written into dst with row / img byte strides
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img);

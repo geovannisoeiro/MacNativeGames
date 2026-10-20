@@ -2974,6 +2974,10 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             trow(f, "@wt_level_lin_mb", (double)(wl - pwl) / 1048576.0);
             trow(f, "@wt_level_gob_mb", (double)(wg - pwg) / 1048576.0);
             trow(f, "@wt_gob_calls", (double)(wgc - pgg));
+            // TOTK (2026-10-20): pipelines created in play that need the border variant. The warm-up can
+            // only pre-warm them if the recorded key says so, and the bit now survives the recording.
+            {   static uint64_t pbd; uint64_t bd; mtl_pso_border_stats(&bd);
+                trow(f, "@pso_border", (double)(bd - pbd)); pbd = bd; }
             pwc = wc; pwr = wr; pwl = wl; pwg = wg; pgg = wgc; pwd = wd; pws = ws; pwa = wa; pwcp = wcp;
             // The four split rows are a diagnostic (DM_NVN_TEXEL_SPLIT) and they cost four of the ring's
             // 64 entries per frame, so they are only written when the split is on. Without the flag they
