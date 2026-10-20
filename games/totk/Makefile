@@ -442,3 +442,10 @@ test-opus-codec:
 .PHONY: probe-gpu-sampler-border
 probe-gpu-sampler-border: runtime-v143
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; TOTK_PROFILE_DIR="$$tmp/profile" TOTK_SHADER_CACHE="$$tmp/cache" DM_PSO_RECORD="$$tmp/pso.tsv" $(GAME_SLOT_RUN) build/totk-native-v143 rewritten/v143 probe-gpu-sampler-border
+.PHONY: probe-borda-identidade
+# CPU only: a identidade da borda — a string que a linha gravada leva, o hash que a chave leva, e
+# o round trip entre os dois. Exercita as funcoes reais (o cabecalho que o port usa).
+probe-borda-identidade:
+	@mkdir -p build analysis
+	xcrun clang -std=gnu11 -O1 -Wall -Wextra -Werror -Wno-unused-function -Ithird_party/d2r_gfx/gfx/nvn -Ithird_party/d2r_gfx/gfx/nvn/include tests/borda_identidade/probe.c -o build/borda-identidade-probe
+	build/borda-identidade-probe | tee analysis/borda-identidade-probe.log

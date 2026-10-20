@@ -1,7 +1,9 @@
 #pragma once
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 #include "nvn_obj.h"
+#include "nvn_border_id.h"
 
 typedef struct {
     const void *vs, *fs; uint32_t cfmt[8], dfmt, sfmt, samples, blend_en, chmask, a2c; blend_st blend[8];
@@ -22,6 +24,11 @@ typedef struct {
 // Runtime-translated TOTK variant keys are up to 79 bytes (SHA-256 plus answer hash and _b).
 // The old 24-byte fields silently truncated them and made recorded render PSOs impossible to warm.
 typedef struct { char vs[80], fs[80]; uint8_t vs_stage, fs_stage, merged, fz; pso_fz_desc fz_desc; pso_key k; } pso_skey;
+// TOTK (2026-10-21): o formato gravado depende destes tamanhos — o hex tem de ter 1104 caracteres
+// e o legado 1088 (a linha sem o bid). Se a struct mudar, o build para aqui em vez de o parser
+// aceitar silenciosamente linhas de outro formato.
+_Static_assert(sizeof(pso_key) == 352, "pso_key: 344 + o bid de 64 bits (a forma da linha gravada depende disto)");
+_Static_assert(sizeof(pso_skey) == 552, "pso_skey: 544 + o bid (a forma da linha gravada depende disto)");
 
 static inline void pso_skey_from(const pso_key *k, NvShader *vs, NvShader *fs, int merged, const pso_fz_desc *fz, pso_skey *out) {
     memset(out, 0, sizeof *out);
