@@ -222,7 +222,11 @@ static void *input_file(void *arg) {
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
         } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }
-        else runtime_fail("invalid diagnostic input command");
+        // TOTK (2026-10-20): a malformed line in the diagnostic channel must not kill the game. The channel is
+        // written from outside (a test script), and in an unattended run one typo used to end the whole
+        // measurement: the port died with "invalid diagnostic input command" and the run was lost. The line is
+        // reported and skipped; the game carries on.
+        else fprintf(stderr, "[totk-input] file: unknown command, ignored: %s", line);
     }
     fclose(f); return NULL;
 }
