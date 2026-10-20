@@ -194,6 +194,11 @@ probe-fps-overlay:
 	@mkdir -p build/tests
 	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn tests/fps_overlay/probe.c third_party/d2r_gfx/gfx/nvn/fps_overlay.c third_party/d2r_gfx/gfx/nvn/totk_sysload.c -framework IOKit -framework CoreFoundation -framework CoreGraphics -framework CoreText -o build/tests/fps_overlay_probe
 	build/tests/fps_overlay_probe
+# The thread census: does it find a thread by name? (CPU only, no game)
+probe-census:
+	@mkdir -p build/tests
+	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn tests/census/probe.c third_party/d2r_gfx/gfx/nvn/totk_census.c -o build/tests/census_probe
+	build/tests/census_probe
 .PHONY: probe-audio
 probe-audio: runtime
 	build/totk-native rewritten/v0 probe-audio > analysis/native-audio-probe.json

@@ -31,6 +31,7 @@
 #include "nvn_dirty.h"
 #include "totk_vpool.h"
 #include "totk_lifelog.h"
+#include "totk_census.h"
 #include <mach/mach_time.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -3065,5 +3066,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         if (a_ > 0) trow(f - 8, "@pres_at_ms", a_ * 1e3 - g_t0_ns / 1e6); }   // 上屏时刻（进程起点 ms；presentedTime 与 mach_absolute_time 同基） | on-screen present time (ms since process start; presentedTime shares a time base with mach_absolute_time)
     if (f >= 8 && slow_on()) slow_emit(f - 8);
     prev_out = now_ns();
+    // TOTK (2026-10-20): the thread census. It answers "where did the CPU of this frame go?": the process
+    // CPU minus the CPU of this (the present) thread, attributed to the threads that burned it. The census
+    // writes its own TSV and only when DM_NVN_CENSUS is set; when it is off this is one branch.
+    totk_census_frame(f);
     totk_tl(TL_PRES_OUT, 0, 0);
 }
