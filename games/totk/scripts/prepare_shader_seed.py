@@ -418,15 +418,25 @@ def source_reader(romfs, modules, game='totk'):
     return read
 
 
-def plan(shaders, startup, listed):
+def plan(shaders, startup, listed, named=None):
     """Translation jobs (key, answers, variant, why): the default bind state for every startup shader, then each bind
     state the shared list names for a shader found in this game ('listed'). Listed states the default already produced
-    are dropped after translation (prepare), since only the translator knows a shader's deps."""
+    are dropped after translation (prepare), since only the translator knows a shader's deps.
+
+    TOTK (2026-10-20): 'named' maps (base, deps) to the name the runtime gave that variant, when the shared list
+    carries it (a row 'N'). The runtime names a variant H(base, the whole bound state) and the build names it
+    H(base, {**empty, **deps}) -- two different functions, so one (base, deps) gets two names, and the warm-up
+    (which looks a variant up BY NAME, nvn_mtl.m:6252) cannot find the seed's file under the name the pipeline
+    lists ask for. The content is the same (the .metal of a (base, deps) pair is byte-identical in the seed and in
+    the runtime cache: 22,343 of 22,343 measured), only the name differs, and the name is a parameter of the
+    request to the service (Service.cs:286), so the build can ask for the file under the name the list wants."""
+    named = named or {}
     jobs = [(key, ANSWERS, key+'-'+SUFFIX, 'default') for key in sorted(startup)]
     for key, deps in sorted(listed):
         if key in shaders:
             answers = {**ANSWERS, **json.loads(deps)}
-            jobs.append((key, answers, key+'-'+suffix(answers), 'listed'))
+            variant = named.get((key, deps))
+            jobs.append((key, answers, variant if variant else key+'-'+suffix(answers), 'listed'))
     return jobs
 
 
@@ -435,6 +445,7 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None, m
     min_shaders = GAMES[game]['min_shaders']
     shared = ShaderList.load(shader_list)
     listed = shared.variants
+    names = shared.named
     identity = dict(schema=1, chain=CHAIN, version=version, game=game,
                     source_romfs_sha256=json.loads((romfs/'index.json').read_text())['romfs_sha256'],
                     translator_sha256=digest(translator.read_bytes()),
@@ -453,7 +464,7 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None, m
     extra = located({where for where in shared.locators if where[0] not in shaders}, source_reader(romfs, modules, game), game)
     shaders.update(extra)
     print(f'{len(extra)} more shaders read where the shared list locates them (agl .sharcb, game module)', flush=True)
-    jobs = plan(shaders, startup, listed)
+    jobs = plan(shaders, startup, listed, names)
     # One translator service per core. A shader's jobs (its default bind state, then its listed ones) run in order on
     # one service, because whether a listed job is translated and kept depends on that shader's earlier results; the
     # files each job writes are named after its own shader. The results are then taken in the order of `jobs`, so the
