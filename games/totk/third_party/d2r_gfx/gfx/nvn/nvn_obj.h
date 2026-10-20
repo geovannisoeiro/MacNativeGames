@@ -294,6 +294,9 @@ void mtl_create_stats(uint64_t *lib, uint64_t *pso);
 // touches in the pool). gob_calls counts the calls that took move()'s block-linear branch; a linear texture
 // takes the cheap branch and has no block-linear footprint, so the two must not be averaged together.
 void mtl_texels_stats(uint64_t *calls, uint64_t *region, uint64_t *lin, uint64_t *gob, uint64_t *gobcalls);   // 累计：提交线程上同步载入的着色器库数、同步新建的渲染 + 计算管线数（预热领用的不算） | Cumulative: number of shader libraries loaded synchronously on the submit thread, number of render + compute pipelines created synchronously (those taken from warm-up do not count)
+// TOTK (2026-10-20): the split of the CPU texel-write round trip, in nanoseconds: the pool->linear half, the
+// linear->pool half, the allocator pair (malloc+free of the level buffer) and the region's own copy.
+void mtl_texels_split_ns(uint64_t *desw_ns, uint64_t *swiz_ns, uint64_t *alloc_ns, uint64_t *copy_ns);
 // CPU 读贴图：level / layer0 起，按 row / img 字节步长写进 dst
 // CPU texture read: starting at level / layer0, written into dst with row / img byte strides
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img);

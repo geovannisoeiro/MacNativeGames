@@ -472,6 +472,24 @@ uint32_t (*dm_thread_tick_fn)(void);   // 取当前游戏拍；diag.c 初始化�
 void crash_thread_init(void);
 void guest_thread_init(void);   // thread.c：每线程 TSD 槽（门、x18、TLS、TLR）唯一设置点 | thread.c: the single place that sets the per-thread TSD slots (gate, x18, TLS, TLR)
 __attribute__((weak)) void runtime_hle_stack_set(uintptr_t top) { (void)top; }   // standalone thread probe: no host-stack switch
+// TOTK (2026-10-20): the guest's threads have no pthread name, so every one of them shows up as
+// "totk-native" in Activity Monitor, in `sample`, and in the port's own load line (the busiest-thread
+// report falls back to a thread id because pthread_getname_np returns nothing). With
+// DM_NVN_THREADNAMES the thread names itself from its guest handle, which is what the handle already
+// identifies it by (h=0x1004..). The name is only observable (Activity Monitor, `sample`, the load
+// line); nothing in this tree reads a thread name to decide anything, so naming cannot change
+// behaviour. The name is capped at 31 bytes because the reader uses a 32-byte buffer.
+static int guest_thread_names_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DM_NVN_THREADNAMES") != NULL;
+    return on;
+}
+static void guest_thread_name(const thr_t *t) {
+    if (!guest_thread_names_on() || !t) return;
+    char nm[32];
+    snprintf(nm, sizeof nm, "totk-guest-%#x", t->handle);
+    pthread_setname_np(nm);   // names THIS thread (the calling one), so it is called from the thread itself
+}
 static void *thread_main(void *p) {
     thr_t *t = p;
     pthread_setspecific(g_keythr, t);
@@ -479,6 +497,7 @@ static void *thread_main(void *p) {
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
     t->mport = pthread_mach_thread_np(pthread_self());
+    guest_thread_name(t);   // TOTK (2026-10-20): name this guest thread, so the load line and the samplers can say WHICH one (DM_NVN_THREADNAMES)
 
     guest_thread_init();
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); core_take(t); pthread_mutex_unlock(&G);
@@ -530,6 +549,7 @@ uint32_t svc_thread_main_init(void) {
     pthread_setspecific(g_keythr, t);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
+    guest_thread_name(t);   // TOTK (2026-10-20): the main guest thread is the one that presents; name it too
     return t->handle;
 }
 

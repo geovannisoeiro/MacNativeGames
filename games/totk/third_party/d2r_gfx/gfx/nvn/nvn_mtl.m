@@ -4766,6 +4766,9 @@ static _Atomic int g_warm_running;   // 后台预热还没跑完（进局读取�
 static _Atomic int g_warm_priority_done;
 static _Atomic uint64_t g_warm_library_ns,g_warm_library_count,g_warm_pipeline_ns,g_warm_pipeline_count;
 static uint64_t g_warm_rps, g_warm_cps, g_warm_skip_fz;
+// TOTK (2026-10-20): por que o warm-up saltou uma linha. Sem isto o salto e silencioso, e a unica pista e o
+// contador de shaders em falta — que nao diz se a linha saltada era uma pipeline que o jogo ia pedir.
+static uint64_t g_warm_skip_missing, g_warm_skip_parse, g_warm_skip_other;
 static uint64_t g_warm_claim_shaders, g_warm_claim_rps, g_warm_claim_cps;
 static id<MTLFunction> bf_fn(NvShader *fs, const int *fx, uint8_t fbmask, const uint8_t *lmap);
 static int rt_range_bindings_ro(NSDictionary *j);
@@ -6302,6 +6305,13 @@ static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交�
     pthread_mutex_unlock(&g_pp_mu);
     return ps;
 }
+// TOTK (2026-10-20): definido mais abaixo (perto do warm-up); declarado aqui para o log de pipeline em falta.
+static int warm_have_any(NSString *key);
+// TOTK (2026-10-20): as pipelines criadas em jogo (o warm-up nao as tinha) sao a populacao A — 43,7% do tempo
+// acima de 100 ms na e1. Este log diz, por pipeline, se os shaders dela estavam no cache de traducao: se nao
+// estavam, o warm-up saltou a linha por falta de shader (cobertura); se estavam, a pipeline nunca foi pedida
+// ao warm-up (as listas nao a cobrem). Ate 400 linhas, com DM_PSO_MISS=1.
+static int pso_miss_log_on(void) { static int on = -1; if (on < 0) on = getenv("DM_PSO_MISS") != NULL; return on; }
 static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRenderPassDescriptor *unused) {
     (void)unused;
     __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
@@ -6323,6 +6333,18 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
         if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
         MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, bfn ? bfn : g_pso_fsfn, g_pso_lmap != NULL);
         ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+        // TOTK (2026-10-20): por que esta pipeline nao estava pronta? O warm-up devia tê-la compilado. Se os shaders
+        // dela nao estao no cache de traducao, o warm-up saltou a linha (cobertura em falta). Se estao, a pipeline
+        // nunca foi pedida ao warm-up (as listas nao a cobrem). A distincao decide o conserto.
+        if (pso_miss_log_on()) { static int n;
+            if (n < 400) { n++;
+                MLOG("[pso-miss] frame %llu: vs[%d] %s %s | fs[%d] %s %s | %.2f ms",
+                     (unsigned long long)atomic_load(&g_cur_frame),
+                     vs ? (int)vs->stage : -1, vs ? vs->key : "-", warm_have_any(vs ? @(vs->key) : nil) ? "cache" : "AUSENTE",
+                     fs ? (int)fs->stage : -1, fs ? fs->key : "-", warm_have_any(fs ? @(fs->key) : nil) ? "cache" : "AUSENTE",
+                     (bp_now() - bt) / 1e6);
+            }
+        }
     }
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
     if (!ps) { static int said; if (said++ < 12) MLOG("【红】建渲染管线失败：%s（vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d）", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("【红】建渲染管线失败：后续不再逐条打印"); return nil; }
@@ -6339,8 +6361,23 @@ static NSString *warm_key(const char *s, size_t n) {
     return [[NSString alloc] initWithBytes:s length:z encoding:NSUTF8StringEncoding];
 }
 static _Atomic uint64_t g_warm_missing;   // shaders named in the warm lists that are not in the translation cache (yet)
+// TOTK (2026-10-20): a mesma pergunta sem o contador. O contador `g_warm_missing` é do warm-up e não pode ser
+// poluído por uma medição; esta cópia serve para dizer, por pipeline criada em jogo, se os shaders dela estavam
+// no cache de tradução (o warm-up devia tê-los compilado) ou não — a diferença entre "cobertura em falta" e
+// "pipeline que o jogo nunca pediu antes".
+// TOTK (2026-10-21): o upstream renomeou warm_available para warm_have e tornou-o sensível ao scope
+// (totk_shader_scope_contains: o warm-up só aquece os shaders DESTA versão do jogo). Esta cópia é a mesma
+// pergunta SEM o scope — um pipeline criado em jogo pode ser de outra versão — por isso tem outro nome.
+static int warm_have_any(NSString *key) {
+    if (!key.length) return 1;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *rt = totk_rt_dir();
+    return [fm fileExistsAtPath:[rt stringByAppendingFormat:@"/%@.metal", key]] ||
+           [fm fileExistsAtPath:[rt stringByAppendingFormat:@"/%@.metallib", key]] ||
+           [fm fileExistsAtPath:[g_msl_dir stringByAppendingFormat:@"/%@.metallib", key]];
+}
 static NSSet<NSString *> *g_warm_scope;   // totk_rt_shader_scope(): this game version's shaders; nil = warm everything
-static int warm_available(NSString *key) {
+static int warm_have(NSString *key) {
     if (!key.length) return 1;
     if (!totk_shader_scope_contains(g_warm_scope, key)) return 0;
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -6488,20 +6525,20 @@ static void warm_plan(NSArray<NSString *> *paths, NSArray<NSString *> *files, NS
             [rows addObject:line];
             NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
             if ([c[0] isEqualToString:@"S"] && c.count >= 3 && [c[1] length]) {
-                if (!warm_available(c[1])) continue;
+                if (!warm_available(c[1])) { g_warm_skip_missing++; continue; }
                 [keys addObject:c[1]];
             }
             else if ([c[0] isEqualToString:@"R"] && c.count >= 2) {
-                pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk)) continue;
+                pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk)) { g_warm_skip_parse++; continue; }
                 NSString *vs = warm_key(sk.vs, sizeof sk.vs), *fs = warm_key(sk.fs, sizeof sk.fs);
                 // Evaluate both so the missing-shader count remains deduplicated.
                 int av = warm_available(vs), af = warm_available(fs);
-                if (!av || !af) continue;
+                if (!av || !af) { g_warm_skip_missing++; continue; }
                 if (vs.length) [keys addObject:vs]; if (fs.length) [keys addObject:fs]; ++*pipelines;
             } else if ([c[0] isEqualToString:@"C"] && c.count >= 2 && [c[1] length]) {
-                if (!warm_available(c[1])) continue;
+                if (!warm_available(c[1])) { g_warm_skip_missing++; continue; }
                 [keys addObject:c[1]]; ++*pipelines;
-            } else continue;
+            } else { g_warm_skip_other++; continue; }
             [eligible addObject:line]; ++*tasks;
         }
     }
@@ -6630,6 +6667,9 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
         }
         if (runtime_warm_progress) runtime_warm_progress(done,total,dict.count,shader_total,g_warm_rps+g_warm_cps,pipeline_total);
         MLOG("缓存补充预热：新增 %llu 个着色器，%llu 个失败；清单里还不在翻译缓存的着色器 %llu 个（第一次用到时现翻，自动收集）", cached, failed, (unsigned long long)g_warm_missing);
+        // TOTK (2026-10-20): quantas linhas o warm-up saltou e por que. O salto era silencioso; a populacao A
+        // (pipelines criadas em jogo, 43,7% do tempo de quadro longo na e1) nasce aqui.
+        MLOG("预热跳过：缺着色器 %llu 行，键解析失败 %llu 行，其他 %llu 行", g_warm_skip_missing, g_warm_skip_parse, g_warm_skip_other);
         MLOG("管线预热完成：着色器 %llu 个 / 渲染管线 %llu 个（跳过特化片元 %llu）/ 计算管线 %llu 个，后台用时 %.1f ms（着色器库 %d 个线程%s）",
              (unsigned long long)dict.count, g_warm_rps, g_warm_skip_fz, g_warm_cps, (bp_now() - g_warm_t0) / 1e6, warm_threads(),
              atomic_load(&g_warm_in_play) && warm_threads() > 2 ? "，进世界后 2 个" : "");
@@ -10457,12 +10497,57 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
 // no 16-byte segments) and has no GOB footprint at all, so the two are counted apart: mixing them
 // would average two incomparable costs.
 static _Atomic uint64_t g_wt_calls, g_wt_region_b, g_wt_level_lin_b, g_wt_level_gob_b, g_wt_gob_calls;
+// TOTK (2026-10-20): the split of the round trip inside mtl_write_texels. The mirrored path takes the whole
+// level out of the pool (nvn_deswizzle), copies the region, and puts the level back (nvn_swizzle); the level is
+// malloc'd and freed per call. Which of those costs what decides the shape of the fix: a symmetric round trip
+// has to lose both halves, an asymmetric one only the expensive half. The malloc/free pair is counted apart
+// because the level buffer is large enough (megabytes) that the allocator's page behaviour may be a real
+// slice of it -- malloc alone does not touch the pages, so this counts the calls, not the zeroing.
+static _Atomic uint64_t g_wt_desw_ns, g_wt_swiz_ns, g_wt_alloc_ns, g_wt_copy_ns;
+// TOTK (2026-10-20): the four phases of the round trip, timed apart. Which half is the expensive one decides
+// the shape of the fix: a symmetric round trip has to lose both halves, an asymmetric one only the expensive
+// half. These are wrappers rather than inline timing so that a change to the round trip only has to touch
+// the call sites, not the measurement.
+// NOTE: a large malloc does not touch its pages, so the kernel's zero-fill shows up as page faults inside
+// the phase that WRITES into the buffer (the deswizzle), not as time inside malloc itself.
+static inline int wt_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t pitch) {
+    uint64_t t0 = bp_now();
+    int r = nvn_deswizzle(d, level, layer, src, dst, pitch);
+    atomic_fetch_add(&g_wt_desw_ns, bp_now() - t0);
+    return r;
+}
+static inline int wt_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t pitch, void *dst) {
+    uint64_t t0 = bp_now();
+    int r = nvn_swizzle(d, level, layer, src, pitch, dst);
+    atomic_fetch_add(&g_wt_swiz_ns, bp_now() - t0);
+    return r;
+}
+static inline void *wt_malloc(size_t n) {
+    uint64_t t0 = bp_now();
+    void *p = malloc(n);
+    atomic_fetch_add(&g_wt_alloc_ns, bp_now() - t0);
+    return p;
+}
+static inline void wt_free(void *p) {
+    uint64_t t0 = bp_now();
+    free(p);
+    atomic_fetch_add(&g_wt_alloc_ns, bp_now() - t0);
+}
 void mtl_texels_stats(uint64_t *calls, uint64_t *region, uint64_t *lin, uint64_t *gob, uint64_t *gobcalls) {
     if (calls) *calls = atomic_load(&g_wt_calls);
     if (region) *region = atomic_load(&g_wt_region_b);
     if (lin) *lin = atomic_load(&g_wt_level_lin_b);
     if (gob) *gob = atomic_load(&g_wt_level_gob_b);
     if (gobcalls) *gobcalls = atomic_load(&g_wt_gob_calls);
+}
+// TOTK (2026-10-20): the split of the write round trip, in nanoseconds (per frame; the caller keeps the previous
+// value). Separate from mtl_texels_stats so that the byte counters and the time counters can evolve apart.
+// desw = pool->linear, swiz = linear->pool, alloc = malloc+free of the level buffer, copy = the region's own copy.
+void mtl_texels_split_ns(uint64_t *desw_ns, uint64_t *swiz_ns, uint64_t *alloc_ns, uint64_t *copy_ns) {
+    if (desw_ns) *desw_ns = atomic_load(&g_wt_desw_ns);
+    if (swiz_ns) *swiz_ns = atomic_load(&g_wt_swiz_ns);
+    if (alloc_ns) *alloc_ns = atomic_load(&g_wt_alloc_ns);
+    if (copy_ns) *copy_ns = atomic_load(&g_wt_copy_ns);
 }
 void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
@@ -10476,7 +10561,7 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
     TILELOG(t, "WriteTexels lv%u xy=%d,%d %dx%d owned %d mirrored %d flags=%#x pbh=%d tileH=%u size=%llu", level, r->xoffset, r->yoffset, r->width, r->height, gpu_owned(t->serial), tex_mirrored(t), t->d.flags, t->d.pkg_block_h, t->L.tileH, (unsigned long long)t->L.size);
     if (tex_mirrored(t)) {
         size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
-        uint8_t *lin = malloc(lp * lr * lz);
+        uint8_t *lin = wt_malloc(lp * lr * lz);   // TOTK (2026-10-20): the allocator's share of this call
         if (!lin) die("WriteTexels: out of memory");
         dm_guest_write_prepare(t->mem, t->L.size);
         {   // TOTK (2026-10-20): what this call moves. The GOB span of the level is the difference of
@@ -10492,12 +10577,14 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
         }
         for (int z = 0; z < nz; z++) {
             unsigned layer = is3d ? 0 : layer0 + r->zoffset + z;
-            if ((is3d && z == 0) || !is3d) if (nvn_deswizzle(&t->d, level, layer, t->mem, lin, lp)) die("WriteTexels: unsupported layout");
+            if ((is3d && z == 0) || !is3d) if (wt_deswizzle(&t->d, level, layer, t->mem, lin, lp)) die("WriteTexels: unsupported layout");
             uint8_t *dst = lin + (is3d ? (size_t)(r->zoffset + z) * lp * lr : 0);
+            uint64_t _wt_c0 = bp_now();   // TOTK (2026-10-20): the region's own copy (the useful part)
             for (size_t y = 0; y < hb; y++) memcpy(dst + (y0 + y) * lp + x0, src + z * img + y * row, wb);
-            if (!is3d || z == nz - 1) if (nvn_swizzle(&t->d, level, layer, lin, lp, t->mem)) die("WriteTexels: unsupported layout");
+            atomic_fetch_add(&g_wt_copy_ns, bp_now() - _wt_c0);
+            if (!is3d || z == nz - 1) if (wt_swizzle(&t->d, level, layer, lin, lp, t->mem)) die("WriteTexels: unsupported layout");
         }
-        free(lin);
+        wt_free(lin);
         /* TOTK: a mirrored texture the GPU has rendered into is never re-uploaded from its pool bytes (tex_mtl), so the
            write goes into the MTLTexture as well (below); the pool bytes stay in step for texture objects created later. */
         if (!gpu_owned(t->serial)) return;
