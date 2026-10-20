@@ -186,8 +186,10 @@ int main(int argc, char **argv) {
             printf("%s: game version %s\n", ok ? "ok" : "missing binary or version mismatch", TOTK_GAME_VERSION);
             /* TOTK (2026-10-20): the build launches the app AS AN APP (LaunchServices) to pay the
                bundle validation there, and it needs to know the outcome -- launched that way, stdout
-               goes to the system log, not to the build. TOTK_CHECK_MARKER names a file to write. */
-            const char *marker = getenv("TOTK_CHECK_MARKER");
+               goes to the system log, not to the build. The marker path comes as the SECOND
+               argument (argv[2]), not as an environment variable: launched by LaunchServices, the
+               app does NOT inherit the caller's environment (measured: the env var never arrived). */
+            const char *marker = argc > 2 ? argv[2] : getenv("TOTK_CHECK_MARKER");
             if (marker && *marker) {
                 FILE *mf = fopen(marker, "w");
                 if (mf) { fprintf(mf, "%s\n", ok ? "ok" : "missing binary or version mismatch"); fclose(mf); }
