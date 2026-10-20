@@ -24,3 +24,8 @@ uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, u
 int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
                        uint32_t *row_bytes, uint32_t *rows, uint32_t *slices,
                        uint64_t *base, unsigned *tileH, unsigned *tileD, uint32_t *bpb);
+// 写入一块区域到块线性存储，不经过整个级别的往返（见 .c 里的说明）。返回 0 = 写入，-1 = 这张贴图不适用。
+// Write one region into the block-linear storage, without the whole-level round trip (see the .c).
+// 0 = written, -1 = this texture does not qualify (the caller falls back to the round trip).
+int nvn_write_region_gob(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *pool,
+                         const uint8_t *src, size_t row, size_t x0, size_t wb, size_t y0, size_t hb, uint32_t slice);
