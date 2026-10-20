@@ -10510,25 +10510,35 @@ static _Atomic uint64_t g_wt_desw_ns, g_wt_swiz_ns, g_wt_alloc_ns, g_wt_copy_ns;
 // the call sites, not the measurement.
 // NOTE: a large malloc does not touch its pages, so the kernel's zero-fill shows up as page faults inside
 // the phase that WRITES into the buffer (the deswizzle), not as time inside malloc itself.
+// TOTK (2026-10-20): the phase split is a DIAGNOSTIC, and it costs a clock read per phase. It is off
+// unless DM_NVN_TEXEL_SPLIT asks for it, so the production path pays a predictable branch and nothing else.
+static int wt_split_on(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_TEXEL_SPLIT"); on = e && atoi(e) > 0; }
+    return on;
+}
 static inline int wt_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t pitch) {
+    if (!wt_split_on()) return nvn_deswizzle(d, level, layer, src, dst, pitch);
     uint64_t t0 = bp_now();
     int r = nvn_deswizzle(d, level, layer, src, dst, pitch);
     atomic_fetch_add(&g_wt_desw_ns, bp_now() - t0);
     return r;
 }
 static inline int wt_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t pitch, void *dst) {
+    if (!wt_split_on()) return nvn_swizzle(d, level, layer, src, pitch, dst);
     uint64_t t0 = bp_now();
     int r = nvn_swizzle(d, level, layer, src, pitch, dst);
     atomic_fetch_add(&g_wt_swiz_ns, bp_now() - t0);
     return r;
 }
 static inline void *wt_malloc(size_t n) {
+    if (!wt_split_on()) return malloc(n);
     uint64_t t0 = bp_now();
     void *p = malloc(n);
     atomic_fetch_add(&g_wt_alloc_ns, bp_now() - t0);
     return p;
 }
 static inline void wt_free(void *p) {
+    if (!wt_split_on()) { free(p); return; }
     uint64_t t0 = bp_now();
     free(p);
     atomic_fetch_add(&g_wt_alloc_ns, bp_now() - t0);
@@ -10539,8 +10549,14 @@ static inline void wt_free(void *p) {
 // variante directa (nvn_write_region_gob, na camada tex) escreve cada segmento de 16 bytes da regiao
 // onde o GOB o quer e produz um pool byte-identico ao do round trip (provado por
 // tests/texture_auto_layout/region_probe.c).
-static int wt_direct_on(void) {   // TOTK (2026-10-20): o interruptor do probe (A/B sem rebuild)
-    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_GOB_DIRECT"); on = e && *e && strcmp(e, "0"); }
+// TOTK (2026-10-20): the direct region write is the DEFAULT. It writes the region's bytes straight to
+// their block-linear offset in the pool, where the round trip took the whole level out and put it back
+// (8.14 MB of level per 24.3 KB of payload, 335x). The pool comes out byte-identical: proven over 942
+// configurations offline (tests/texture_auto_layout/region_probe.c) and over 39 writes compared on the
+// real pool in the game (TOTK_GOB_VERIFY, zero mismatches). TOTK_GOB_DIRECT=0 goes back to the round
+// trip, which is what the linear-texture case and the gpu_owned case still use.
+static int wt_direct_on(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_GOB_DIRECT"); on = !(e && *e && !strcmp(e, "0")); }
     return on;
 }
 static _Atomic uint64_t g_gob_match, g_gob_mismatch, g_gob_mismatch_b;   // TOTK (2026-10-20): a verificacao dentro do jogo
