@@ -5765,6 +5765,7 @@ static NSMutableDictionary<NSString *, id<MTLLibrary>> *g_bf_lib_cache;
 static nvn_hmap g_pso = {.klen = sizeof(pso_key)}, g_dss;
 // TOTK (2026-10-20): pipelines the game creates in play that need the sampler-border-colour variant.
 static _Atomic uint64_t g_pso_border;
+static _Atomic uint64_t g_pso_bid;   // TOTK (2026-10-21): pipelines criadas em jogo com identidade de borda (as duas etapas)
 // TOTK: stages are translated separately, so a fragment shader may read user varyings the vertex shader never writes
 // (undefined values on the Switch GPU). Metal rejects such pairs; the vertex function gets the missing outputs added
 // (left zero) in a patched copy of its MSL, cached per missing set.
@@ -6320,18 +6321,25 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     // warm-up and the game do not share instances, so a pointer in the key could never match. k.fsfn
     // therefore stays NULL for a border pipeline — the fragment's border function goes to the
     // descriptor, not to the key — and the identity string is kept to be recorded with the row.
-    border_stage vbs, fbs; border_stage_init(&vbs); border_stage_init(&fbs);
+    border_stage vbs; border_stage_init(&vbs);
     char bidstr[2048]; bidstr[0] = 0;   // two stages of up to 8 samplers each: the identity string
+    // O VERTICE: como antes, verificado SEMPRE (o codigo antigo punha o bit incondicionalmente) — os
+    // passes merged e os MetalFX role excluiam so o FRAGMENTO. Perder o bit aqui seria uma regressao:
+    // a variante do vertex passaria a ser a plain e a chave a coincidir com a de um draw sem borda.
+    // TOTK (2026-10-21): o vertice com fs == NULL nao existe (o codigo aborta antes), mas o FRAGMENTO
+    // pode ser nulo (um draw so com vertex shader) — a guarda e obrigatoria, border_key() desreferencia.
+    float vc[8][4]; int va[8], vn = 0;
+    NSString *vk = border_key(vs, 0, vc, va, &vn);
+    if (vk) { vbs.key = vk; memcpy(vbs.colours, vc, sizeof vc); memcpy(vbs.aids, va, sizeof va); vbs.n = vn; k.a2c |= PSO_VBORDER; }
+    // O FRAGMENTO: fora dos passes merged e dos MetalFX role, como antes.
     __unsafe_unretained id<MTLFunction> bfn = nil;
-    if (!g_pso_lmap && !g_mfx.role) {   // TOTK: sampler border colour emulation
+    NSString *fk = nil;
+    if (!g_pso_lmap && !g_mfx.role && fs && sh_has_src(fs)) {
         float fc[8][4]; int fa[8], fn = 0;
-        NSString *fk = border_key(fs, 1, fc, fa, &fn);
-        if (fk) { bfn = fs_fn_border_for(fs, k.dfmt == 0, fk, fc, fa, fn); fbs.key = fk; memcpy(fbs.colours, fc, sizeof fc); memcpy(fbs.aids, fa, sizeof fa); fbs.n = fn; }
-        float vc[8][4]; int va[8], vn = 0;
-        NSString *vk = border_key(vs, 0, vc, va, &vn);
-        if (vk) { vbs.key = vk; memcpy(vbs.colours, vc, sizeof vc); memcpy(vbs.aids, va, sizeof va); vbs.n = vn; k.a2c |= PSO_VBORDER; }
-        if (fk || vk) { border_id_str(bidstr, sizeof bidstr, vk, fk); k.bid = border_id_hash(bidstr); }
+        fk = border_key(fs, 1, fc, fa, &fn);
+        if (fk) bfn = fs_fn_border_for(fs, k.dfmt == 0, fk, fc, fa, fn);
     }
+    if (vk || fk) { border_id_str(bidstr, sizeof bidstr, vk, fk); k.bid = border_id_hash(bidstr); }
     __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
     if (cached) return cached;
     id<MTLRenderPipelineState> ps;
@@ -6357,21 +6365,21 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     }
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
     if (!ps) { static int said; if (said++ < 12) MLOG("【红】建渲染管线失败：%s（vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d）", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("【红】建渲染管线失败：后续不再逐条打印"); return nil; }
-    // TOTK (2026-10-20): the recorded key clears the border bit, and that is deliberate. A border pipeline
-    // cannot be rebuilt at boot: border_key() reads the samplers the DRAW has bound (S.samp / S.tex) and
-    // their border colours (g_sreg), and at warm-up time there is no draw and no sampler bound, so it
-    // returns nil and fs_fn_border() / vs_fn_for() hand back the PLAIN functions. Recording the bit would
-    // therefore have the warm-up build the plain pipeline under the border key -- and the game, whose key
-    // for a vertex-stage border (the fragment needs none) is {bit, fsfn=nil, vs, fs}, would HIT it and
-    // draw with a vertex shader that does not emulate the border colour. The bit is kept in the IN-GAME key
-    // (k.a2c), which is what the counter below measures; only the recorded row drops it.
-    // The real fix is for the key to carry the border IDENTITY (the border_key string: the argument ids and
-    // the colours), so the warm-up can rebuild the exact variant; until then the border pipelines are built
-    // in play, as before, and the counter says how many that is.
+    // TOTK (2026-10-21): a linha gravada e a da pipeline COM a variante de borda, com a identidade na
+    // terceira coluna, e a chave leva o hash da identidade (k.bid). O warm-up reconstrói a variante a
+    // partir da identidade, e o jogo encontra-a em vez de a compilar. A linha plain (rk, aqui em baixo) e
+    // a variante sem borda, que continua a ser gravada para o caso de o mesmo par de shaders ser desenhado
+    // sem sampler de borda ligado.
+    // Antes disto, a linha apagava o bit de borda: o warm-up nao conseguia reconstruir a variante (a
+    // identidade so existe em runtime) e construia a plain, que o jogo nunca pedia. A variante de borda
+    // era compilada em jogo, todas as vezes.
     pso_key rk = k; rk.a2c &= ~PSO_VBORDER; rk.bid = 0; if (bfn) rk.fsfn = NULL;
     // TOTK (2026-10-20): how many of the pipelines the game builds in play need the border variant.
     // It is the number that decides whether pre-warming them is worth the warm-up's time.
     if (k.a2c & PSO_VBORDER) atomic_fetch_add(&g_pso_border, 1);
+    // TOTK (2026-10-21): o @pso_border conta as pipelines com borda no VERTICE (e o bit e o vertice). A
+    // identidade de borda (k.bid) conta as duas etapas — e e esta a que diz se o conserto pegou.
+    if (k.bid) atomic_fetch_add(&g_pso_bid, 1);
     pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&rk, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
     if (survey_shader_log()) MLOG("[survey-shader] frame %llu render pipeline %s in %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), shex, (bp_now() - bt) / 1e6);
     pso_record("R\t%s\n", shex);
@@ -6633,6 +6641,11 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                             // shader and the identity, so the warm-up compiles the same variant the game would
                             // have compiled in play. The identity in the key is the hash, not a pointer, because
                             // the patch caches are per shader instance and the two sides do not share instances.
+                            // Com o jogo a jogar, a compilacao segura o lock de patch que o jogo toma em
+                            // cada pso_get — o warm-up nao pode prender a thread de submissao. As variantes
+                            // que o jogo precisa na entrada no mundo ja estao na lista do utilizador, que
+                            // e a segunda da ordem, e portanto sao construidas antes de o jogo entrar.
+                            if (atomic_load(&g_warm_in_play)) { g_warm_skip_border++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                             if (c.count < 3 || !c[2].length || border_id_hash(c[2].UTF8String) != sk.k.bid) { g_warm_skip_border++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                             NSString *ivk = nil, *ifk = nil;
                             if (border_id_split(c[2].UTF8String, &ivk, &ifk)) { g_warm_skip_border++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
@@ -6813,7 +6826,9 @@ static void warm_light(void) {
             NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
             uint64_t t1 = bp_now(); id ps = nil; int tried = 0;
             if ([c[0] isEqualToString:@"R"] && c.count >= 2) {
-                pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk) || sk.fz) continue;
+                // TOTK (2026-10-21): uma linha de borda nao se reconstrói aqui — border_key() le o estado
+                // de runtime, que nesta thread de fundo nao e o do jogo. Salta-se a linha.
+                pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk) || sk.fz || sk.k.bid) continue;
                 NSString *vkey = warm_key(sk.vs, sizeof sk.vs), *fkey = warm_key(sk.fs, sizeof sk.fs);
                 NvShader *vs = vkey.length ? warm_shader(dict, vkey, sk.vs_stage) : nil, *fs = fkey.length ? warm_shader(dict, fkey, sk.fs_stage) : nil;
                 if (!vs || (fkey.length && !fs)) { nfail++; continue; }
@@ -10555,6 +10570,9 @@ static int wt_verify_slot(int format, int target) {
     return used++;
 }
 void mtl_pso_border_stats(uint64_t *border) { if (border) *border = atomic_load(&g_pso_border); }
+// TOTK (2026-10-21): as pipelines com identidade de borda (as duas etapas) — o numero que diz se o
+// warm-up asconstructed e o jogo as deixou de compilar.
+void mtl_pso_bid_stats(uint64_t *bid) { if (bid) *bid = atomic_load(&g_pso_bid); }
 void mtl_texels_gob_stats(uint64_t *verified, uint64_t *mismatch) {
     if (verified) *verified = atomic_load(&g_gob_match) + atomic_load(&g_gob_mismatch);
     if (mismatch) *mismatch = atomic_load(&g_gob_mismatch);
