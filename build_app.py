@@ -274,6 +274,14 @@ def prepare_work(work, py, logs):
     extracted/, rewritten/, build/ and analysis/ next to themselves); its tooling/ points at the fetched sources."""
     tree = work / 'totk'
     tree.mkdir(parents=True, exist_ok=True)
+    # Spotlight must not index the work folder: it is tens of GB of build intermediates, rewritten
+    # on every build, and the indexer costs the player RAM and disk I/O for nothing (measured:
+    # mds_stores at 267 MB while a build was running, on a machine whose RAM is the wall).
+    # The empty file is Spotlight's own "never index this directory".
+    try:
+        (work / '.metadata_never_index').touch(exist_ok=True)
+    except OSError:
+        pass
     # Match both directories AND symlinks to directories. A trailing slash
     # allows rsync -a to copy a tooling symlink from a development checkout.
     excludes = [f'--exclude=/{name}' for name in ('extracted', 'rewritten', 'build', 'analysis', '.venv', 'tooling', 'user-data')]
