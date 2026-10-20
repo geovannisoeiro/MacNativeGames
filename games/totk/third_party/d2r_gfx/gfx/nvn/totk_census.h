@@ -18,6 +18,11 @@
 //   DM_NVN_CENSUS=<path>   enable it; <path> is the TSV it writes ("1" -> totk-census.tsv in the cwd)
 //   DM_NVN_CENSUS_MIN_MS  unaccounted-process-CPU threshold that triggers a walk (default 40)
 //   DM_NVN_CENSUS_TOP     how many threads per row to report (default 3)
+//
+// The class columns (guest_ms, port_ms, other_ms) are the sum over ALL the threads of the class, not over
+// the top N the row carries; n_guest / n_port / n_other say how many threads each class had. The "guest"
+// class only exists if the guest threads are named: runtime/threads.c names them with DM_NVN_THREADNAMES=1
+// (as "totk-guest-<handle>"). Without that flag every guest thread shows up as "other".
 #pragma once
 #include <stdint.h>
 
