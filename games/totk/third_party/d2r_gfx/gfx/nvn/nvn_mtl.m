@@ -10692,7 +10692,7 @@ static int wt_direct_on(void) {   // TOTK (2026-10-20): o interruptor do probe (
     static int on = -1; if (on < 0) { const char *e = getenv("TOTK_GOB_DIRECT"); on = e && *e && strcmp(e, "0"); }
     return on;
 }
-static _Atomic uint64_t g_gob_match, g_gob_mismatch;   // TOTK (2026-10-20): a verificacao dentro do jogo
+static _Atomic uint64_t g_gob_match, g_gob_mismatch, g_gob_mismatch_b;   // TOTK (2026-10-20): a verificacao dentro do jogo
 static int wt_verify_n(void) {   // TOTK (2026-10-20): quantas escritas se verificam por (formato, target)
     static int n = -1; if (n < 0) { const char *e = getenv("TOTK_GOB_VERIFY"); n = e ? atoi(e) : 0; }
     return n > 0 ? n : 0;
@@ -10810,7 +10810,15 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
                 }
                 if (memcmp(verify_copy, t->mem, t->L.size) != 0) {
                     atomic_fetch_add(&g_gob_mismatch, 1);
-                    MLOG("【红】a escrita directa em GOB difere do round trip (textura %llu, nivel %u, %ux%u+%u,%u)",
+                    // TOTK (2026-10-20): how many bytes differ, and where the first one is. The byte count is
+                    // in the log, not in the TSV: the ring accepts 64 entries per frame and a normal run
+                    // already carries 59, so a third field would push the GPU attribution out.
+                    size_t diff = 0, first = 0; int found = 0;
+                    for (size_t i = 0; i < t->L.size; i++)
+                        if (verify_copy[i] != t->mem[i]) { diff++; if (!found) { first = i; found = 1; } }
+                    atomic_fetch_add(&g_gob_mismatch_b, (uint64_t)diff);
+                    MLOG("【红】a escrita directa em GOB difere do round trip: %llu bytes de %llu, o primeiro no %llu (textura %llu, nivel %u, %ux%u+%u,%u)",
+                         (unsigned long long)diff, (unsigned long long)t->L.size, (unsigned long long)first,
                          (unsigned long long)t->serial, level, (unsigned)r->width, (unsigned)r->height, (unsigned)r->xoffset, (unsigned)r->yoffset);
                 } else {
                     atomic_fetch_add(&g_gob_match, 1);
