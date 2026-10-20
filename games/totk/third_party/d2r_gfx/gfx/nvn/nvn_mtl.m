@@ -10692,6 +10692,11 @@ static int wt_direct_on(void) {   // TOTK (2026-10-20): o interruptor do probe (
     static int on = -1; if (on < 0) { const char *e = getenv("TOTK_GOB_DIRECT"); on = e && *e && strcmp(e, "0"); }
     return on;
 }
+static _Atomic uint64_t g_gob_match, g_gob_mismatch;   // TOTK (2026-10-20): a verificacao dentro do jogo
+static int wt_verify_on(void) {   // TOTK (2026-10-20): a identidade da escrita directa, medida no pool real
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_GOB_VERIFY"); on = e && *e && strcmp(e, "0"); }
+    return on;
+}
 void mtl_texels_stats(uint64_t *calls, uint64_t *region, uint64_t *lin, uint64_t *gob, uint64_t *gobcalls) {
     if (calls) *calls = atomic_load(&g_wt_calls);
     if (region) *region = atomic_load(&g_wt_region_b);
@@ -10740,6 +10745,17 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
             atomic_fetch_add(&g_wt_level_lin_b, (uint64_t)lp * lr * lz);
             if (!is_lin && hi > lo) { atomic_fetch_add(&g_wt_level_gob_b, hi - lo); atomic_fetch_add(&g_wt_gob_calls, 1); }
         }
+        // TOTK (2026-10-20): the in-game identity check. The direct write must leave the pool with the
+        // same bytes as the round trip. The offline probe (tests/texture_auto_layout/region_probe.c)
+        // compares the two on synthetic pools; this compares them on the REAL pool (the real t->mem,
+        // with the real dm_guest_write_prepare and the real formats), which the offline probe cannot do.
+        // It costs a copy of the texture and a full round trip per call, so it is a diagnostic
+        // (TOTK_GOB_VERIFY=1) and never the default.
+        uint8_t *verify_copy = NULL;
+        if (direct && wt_verify_on()) {
+            verify_copy = (uint8_t *)malloc(t->L.size);
+            if (verify_copy) memcpy(verify_copy, t->mem, t->L.size);   // BEFORE the write: the reference
+        }
         for (int z = 0; z < nz; z++) {
             unsigned layer = is3d ? 0 : layer0 + r->zoffset + z;
             if (direct) {   // TOTK (2026-10-20): the region's segments, straight into the pool
@@ -10758,6 +10774,30 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
             if (!is3d || z == nz - 1) if (wt_swizzle(&t->d, level, layer, lin, lp, t->mem)) die("WriteTexels: unsupported layout");
         }
         if (lin) wt_free(lin);
+        if (verify_copy) {   // TOTK (2026-10-20): the reference, computed the round trip's way, and the comparison
+            uint8_t *vlin = (uint8_t *)malloc(lp * lr * lz);
+            if (vlin) {
+                for (int z = 0; z < nz; z++) {
+                    unsigned layer = is3d ? 0 : layer0 + r->zoffset + z;
+                    if ((is3d && z == 0) || !is3d) nvn_deswizzle(&t->d, level, layer, verify_copy, vlin, lp);
+                    uint8_t *dst = vlin + (is3d ? (size_t)(r->zoffset + z) * lp * lr : 0);
+                    for (size_t y = 0; y < hb; y++) memcpy(dst + (y0 + y) * lp + x0, src + z * img + y * row, wb);
+                    if (!is3d || z == nz - 1) nvn_swizzle(&t->d, level, layer, vlin, lp, verify_copy);
+                }
+                if (memcmp(verify_copy, t->mem, t->L.size) != 0) {
+                    atomic_fetch_add(&g_gob_mismatch, 1);
+                    MLOG("【红】a escrita directa em GOB difere do round trip (textura %llu, nivel %u, %ux%u+%u,%u)",
+                         (unsigned long long)t->serial, level, (unsigned)r->width, (unsigned)r->height, (unsigned)r->xoffset, (unsigned)r->yoffset);
+                } else {
+                    atomic_fetch_add(&g_gob_match, 1);
+                    if (atomic_load(&g_gob_match) % 500 == 0)
+                        MLOG("[gob-verify] %llu escritas verificadas, %llu diferentes do round trip",
+                             (unsigned long long)atomic_load(&g_gob_match), (unsigned long long)atomic_load(&g_gob_mismatch));
+                }
+                free(vlin);
+            }
+            free(verify_copy);
+        }
         /* TOTK: a mirrored texture the GPU has rendered into is never re-uploaded from its pool bytes (tex_mtl), so the
            write goes into the MTLTexture as well (below); the pool bytes stay in step for texture objects created later. */
         if (!gpu_owned(t->serial)) return;
