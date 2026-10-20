@@ -2389,7 +2389,13 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (pace < 0) { const char *e = getenv("DM_DETCLOCK_PACE"), *d = getenv("DM_DETCLOCK"); step = d ? strtoull(d, 0, 0) : 0; pace = e && atoi(e) && step; }
         if (pace) { if (last && now_ns() < last + step) sleep_until_ns(last + step); last = now_ns(); }
     }
-    g_acq_wait_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
+    /* @late_ms was unsigned: now_ns() - at wraps when the acquire arrives before the texture is available,
+       which is exactly when the field says something, so it wrote ~1.8e13. Report the signed difference:
+       negative means it arrived early by that much (the case that used to be garbage), positive means late.
+       And report THIS acquire's wait next to the accumulated one, so a reader can tell the two apart. */
+    g_acq_wait_ns += wait;
+    trow(g_frame, "@late_ms", (double)(int64_t)(now_ns() - at) / 1e6);
+    trow(g_frame, "@acq_wait_ms", (double)wait / 1e6);
     // 该张上一次出图还没被出图线程处理完（显示跟不上、落后一整轮交换链）：等它归还，再交给游戏画
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     if (async_replay() && *idx < 4 && g_xp_win == o) x_wait_job(g_xp_job[*idx]);   // TOTK: that image's last present has run (its ticket is set)
@@ -2843,6 +2849,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         trow(f, "@frame_ms", fr); trow(f, "@work_ms", wk); trow(f, "@nvn_ms", nv);
         // 慢帧归因（只在开 DM_NVN_TSV 时取）：本帧出图线程 CPU 时间（换线程记 −1）、进程全部线程 CPU、取图等待按帧累计、出图调用时刻（与 GPU / 上屏时刻同基：进程起点 ms）
         // Slow-frame attribution (taken only when DM_NVN_TSV is on): this frame's present-thread CPU time (−1 if the thread changed), CPU of all threads in the process, acquire wait accumulated per frame, present call time (same base as the GPU / on-screen present times: ms since process start)
+        /* @wait_ms / @pq_wait_ms read the accumulator that the acquire side fills and the end of this function
+           zeroes, so both are this frame's. That reset is the part that matters: without it the field is a ramp
+           (measured: +5.5 ms/frame, 53,829 ms by frame 10,439) and reads as "a hook waited 45 s". */
         trow(f, "@wait_ms", g_acq_wait_ns / 1e6); trow(f, "@pq_wait_ms", g_pq_wait_ns / 1e6);
         if (frame_rec()) {
             static pthread_t pth; static uint64_t pcpu, pproc;
