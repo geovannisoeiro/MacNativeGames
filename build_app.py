@@ -1262,7 +1262,7 @@ def main(argv):
         marker = logs / 'check-app.txt'
         if marker.exists(): marker.unlink()
         env = {**os.environ, 'TOTK_CHECK_MARKER': str(marker)}
-        subprocess.run(['open', '--args', '--check', str(out)], env=env, check=False)
+        subprocess.run(['open', str(out), '--args', '--check'], env=env, check=False)
         deadline = time.time() + 1800
         while time.time() < deadline and not marker.exists():
             time.sleep(2)
