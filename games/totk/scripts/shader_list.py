@@ -6,6 +6,14 @@ It holds no game data, only identifiers; the build turns them into shaders from 
                                 bind state it was translated for (the translator's deps: texture, image, attribute and
                                 fragment output types). The runtime picks a variant by its deps (totk_shader_rt.m
                                 deps_match), so an entry is the shader plus its deps, never a variant name.
+  N <variant name> <deps>      the NAME the runtime gave a variant of that bind state. TOTK (2026-10-20): the runtime
+                                names a variant H(base, the whole bound state) and the build names it
+                                H(base, {**empty, **deps}) -- two different functions, so the same (base, deps) gets
+                                two names, and the warm-up (which looks a variant up BY NAME, nvn_mtl.m:6252) cannot
+                                find the seed's file under the name the pipeline lists ask for. This row carries that
+                                name, so the build can produce the file under it. Measured: the .metal of a
+                                (base, deps) pair is byte-identical in the seed and in the runtime cache (22,343 of
+                                22,343), so the content is right and only the name was missing.
   L <shader key> <source> <control> <code> <length>
                                 where a shader that is no BNSH file sits in the player's game files: <source> is a RomFS
                                 path (a package member after a '/', .zs decompressed) or module:<name> (a game module's
@@ -38,6 +46,7 @@ HEADERS = {'botw': ('# Breath of the Wild shader list v1 (games/totk/scripts/sha
 EXPORT = '# Generated from {} by scripts/shader_list.py; edit that list, not this file.\n'
 KEY = re.compile(r'^[0-9a-f]{64}$')
 VARIANT = re.compile(r'^[0-9a-f]{64}-[0-9a-f]{12}_b$')
+NAMED = re.compile(r'^[0-9a-f]{64}-[0-9a-f]{12}$')
 PIPELINE = re.compile(r'^(?:[0-9a-f]{2})+$')
 HEX = re.compile(r'^[0-9a-f]{1,10}$')
 SOURCE = re.compile(r'^(?:module:[a-z0-9]+|[A-Za-z0-9_.()+-]+(?:/[A-Za-z0-9_.()+-]+)*)$')
@@ -93,6 +102,7 @@ def header_for(path):
 class ShaderList:
     def __init__(self):
         self.variants = set()   # (key, deps)
+        self.named = {}         # (key, deps) -> the name the runtime gave that variant
         self.warm = {}          # warm row -> flags; dicts keep insertion order, the order rows were recorded in
         self.locators = set()   # (key, source, control offset, code offset, length)
 
@@ -106,6 +116,13 @@ class ShaderList:
             if not line or line.startswith('#'):
                 continue
             fields = line.split('\t')
+            if fields[0] == 'N' and len(fields) == 3 and NAMED.match(fields[1]):
+                try:
+                    if canonical(json.loads(fields[2])) == fields[2]:
+                        lst.named[(fields[1].split('-')[0], fields[2])] = fields[1]
+                        continue
+                except ValueError:
+                    pass
             if fields[0] == 'V' and len(fields) == 3 and KEY.match(fields[1]):
                 try:
                     if canonical(json.loads(fields[2])) == fields[2]:
@@ -128,6 +145,7 @@ class ShaderList:
 
     def save(self, path):
         lines = [f'V\t{key}\t{deps}' for key, deps in sorted(self.variants)]
+        lines += [f'N\t{name}\t{deps}' for (key, deps), name in sorted(self.named.items())]
         lines += [f'L\t{k}\t{src}\t{c:x}\t{d:x}\t{n:x}' for k, src, c, d, n in sorted(self.locators)]
         lines += ['\t'.join(row + (flags,)) for row, flags in self.warm.items()]
         Path(path).write_text(header_for(path) + ''.join(line + '\n' for line in lines))
@@ -148,6 +166,15 @@ class ShaderList:
                 deps = canonical(entry.get('deps')) if isinstance(entry, dict) else None
                 if deps is not None:
                     self.variants.add((index.stem, deps))
+                    # TOTK (2026-10-20): o cache do runtime guarda a variante com o NOME que o runtime
+                    # lhe deu (H(base, o estado ligado completo)), e o build nomeia-a
+                    # H(base, {**vazios, **deps}) — funcoes diferentes, pelo que o mesmo par (base, deps)
+                    # fica com dois nomes. O warm-up procura a variante pelo NOME e o runtime procura-a
+                    # pelos DEPS: daqui o desencaixe. Guardar o nome do runtime aqui e o levar na lista
+                    # (linha 'N') e o que permite ao build pedir ao servico o ficheiro com esse nome.
+                    name = entry.get('variant') if isinstance(entry, dict) else None
+                    if isinstance(name, str) and NAMED.match(name):
+                        self.named[(index.stem, deps)] = name
 
     def add_rows(self, path, flag):
         for line in Path(path).read_text().splitlines():
@@ -167,6 +194,13 @@ class ShaderList:
                 if where:
                     self.locators.add(where)
                 continue
+            if fields[0] == 'N' and len(fields) == 3 and NAMED.match(fields[1]):
+                try:
+                    if canonical(json.loads(fields[2])) == fields[2]:
+                        self.named[(fields[1].split('-')[0], fields[2])] = fields[1]
+                        continue
+                except ValueError:
+                    pass
             row = warm_row(fields)
             if row:
                 listed = fields[len(row)] if len(fields) > len(row) and fields[len(row)] in ('t', 'm', 'tm') else ''
@@ -185,7 +219,7 @@ class ShaderList:
         kinds = {k: sum(1 for row in self.warm if row[0] == k) for k in 'SCR'}
         title = sum(1 for flags in self.warm.values() if 't' in flags)
         return (f'{len(self.variants)} variants over {len({k for k, _ in self.variants})} shaders, '
-                f'{len(self.locators)} located; warm rows: '
+                f'{len(self.named)} named, {len(self.locators)} located; warm rows: '
                 f'{kinds["S"]} S, {kinds["C"]} C, {kinds["R"]} R ({title} for the title screen)')
 
 
@@ -214,7 +248,8 @@ def main(argv):
         lst = ShaderList.load(argv[1])
         lines = [l for l in Path(argv[1]).read_text().splitlines() if l and not l.startswith('#')]
         variant_lines = [l for l in lines if l.startswith('V\t')]
-        if variant_lines != sorted(variant_lines) or len(lines) != len(lst.variants) + len(lst.warm) + len(lst.locators):
+        if variant_lines != sorted(variant_lines) or len(lines) != (len(lst.variants) + len(lst.named) +
+                                                                 len(lst.warm) + len(lst.locators)):
             raise ValueError(f'{argv[1]}: variant rows must be sorted and no row repeated (merge rewrites it so)')
         print(lst.counts())
     else:
