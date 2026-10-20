@@ -7811,7 +7811,13 @@ static void pso_predict_rest(void) {
     memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty;
     static int logged; if (g_pp_kicked > (uint64_t)kicked0 && logged++ < 20) MLOG("并行预编：本次提交余下 %d 次绘制，丢给后台 %d 条管线", draws, (int)g_pp_kicked - kicked0);
     g_pp_scans++; g_pp_scan_ns += bp_now() - started; if (stop) g_pp_stop[stop - 1]++;
-    if (g_pp_scans % 100 == 0) {
+    // TOTK (2026-10-20): the statistics line's interval was fixed at 100 scans, and a session makes fewer
+    // than 100 of them (the prediction only fires on a pipeline miss, which is rare) -- so the totals that
+    // say how much of the parallel precompile is actually used (kicked, taken, waits, wait ms) never
+    // appeared. The interval is an env var now: TOTK_PSO_PREDICT_STATS (default 100).
+    static int stats_every = -1;
+    if (stats_every < 0) { const char *e = getenv("TOTK_PSO_PREDICT_STATS"); stats_every = e ? atoi(e) : 100; if (stats_every < 1) stats_every = 1; }
+    if (g_pp_scans % (uint64_t)stats_every == 0) {
         pthread_mutex_lock(&g_pp_mu); uint64_t full = g_pp_full, freed = g_pp_reclaimed, waits = g_pp_waits, wait_ns = g_pp_wait_ns; int busy = 0;
         for (int i = 0; i < PSO_PEND_MAX; i++) busy += g_pp[i].used; pthread_mutex_unlock(&g_pp_mu);
         MLOG("并行预编 至提交 %llu：扫描 %llu 次（平均 %.2f ms；到上限：命令 %llu、键 %llu、时间 %llu），后台开编 %llu 条，绘制领用 %llu 条（等后台 %llu 次共 %.1f ms），表满没收 %llu 条，回收没用上的 %llu 条，表里现有 %d 条",
