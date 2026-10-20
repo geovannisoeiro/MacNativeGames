@@ -14,7 +14,22 @@ typedef struct { uint64_t target; } nvn_pacer;
 static inline uint64_t nvn_pace(nvn_pacer *p, uint64_t now, uint64_t period) {
     if (!period || !p->target) { p->target = now; return 0; }
     uint64_t next = p->target + period;
-    if (now <= next) { p->target = next; return next - now; }
+    if (now <= next) {
+        // TOTK (2026-10-20): the target must not run more than one period ahead of now. The pacer advances
+        // the target by one period per call whenever the caller arrives early, so a caller that runs FASTER
+        // than the period (the uncapped mode, where the game presents at its own rate) lets the target run
+        // away without bound: the texture then looks "available" seconds in the future. Measured: with
+        // TOTK_MFX=0 the acquire's nominal wait reached 28.3 s at p50 after seven minutes, against a frame
+        // that lasts 13.9 ms. The drift is exactly (period - frame interval), in four configurations.
+        // With this cap the target never gets more than one period ahead, the wait is at most one period,
+        // and the texture's availability stays within two periods. It is a no-op when the caller runs inside
+        // the period (the target is already on the grid), and it bounds the runaway when it does not.
+        // A side effect worth stating: the uncapped mode then presents at the period (the display's rate)
+        // rather than faster, which is what a display can actually show.
+        p->target = next;
+        if (p->target > now + period) { p->target = now + period; return period; }
+        return next - now;
+    }
     p->target = now - next < period ? next : now;
     return 0;
 }
