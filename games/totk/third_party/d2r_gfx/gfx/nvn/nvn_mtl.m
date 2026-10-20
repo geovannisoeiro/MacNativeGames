@@ -1366,6 +1366,9 @@ static dispatch_semaphore_t g_ush_sem; static _Atomic int g_ush_next, g_ush_busy
 static const usnap_cap *g_usnap_cap;   // the translation-thread mode's capture, the source of the copies until the helpers are done
 static void *ush_main(void *arg) {
     (void)arg; pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    // TOTK (2026-10-20): the thread census (totk_census.c) classifies threads by name; without a name
+    // the port's own helper threads fall into "other" together with the system's.
+    pthread_setname_np("nvn-ush");
     for (;;) {
         dispatch_semaphore_wait(g_ush_sem, DISPATCH_TIME_FOREVER);
         int n = atomic_load_explicit(&g_ush_n, memory_order_acquire); uint64_t did = 0;
@@ -6577,6 +6580,11 @@ static void warm_load_keys(NSArray<NSString *> *keys, NSArray<NSNumber *> *stage
     warm_par *wp = calloc(1, sizeof *wp); if (!wp) MDIE("预热：内存不足");
     wp->lock = OS_UNFAIR_LOCK_INIT;
     dispatch_apply(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t w) {
+        // TOTK (2026-10-20): name the worker, so the thread census (totk_census.c) can tell the port's
+        // own threads from the guest's and from the system's. The census classifies by NAME, and an
+        // unnamed thread fell into "other" together with the system's. w == 0 runs on the calling
+        // thread (the warm-up's own queue), which is left alone.
+        if (w) pthread_setname_np("nvn-warm");
         for (;;) @autoreleasepool {
             if (w && w >= (size_t)warm_threads_now()) break;   // fewer threads once playing; thread 0 always goes on
             size_t i = atomic_fetch_add(&wp->next, 1);
