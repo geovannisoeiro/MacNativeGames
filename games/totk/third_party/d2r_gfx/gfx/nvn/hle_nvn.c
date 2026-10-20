@@ -502,6 +502,19 @@ NVN(nvnTextureReadTexelsStrided, void, const NVNtexture *t, const NVNtextureView
     read_texels(CTX(t), (const view_t *)v, r, dst, row, img);
 }
 static _Atomic uint64_t g_texels_ns;   // TOTK (2026-10-20): time inside mtl_write_texels, per frame
+// TOTK (2026-10-20): name the thread that ran an expensive texel write. The cost is in the port's copy, but
+// it lands on WHICHEVER guest thread made the call, so without the name the load line cannot say who. The
+// guest's threads are named by runtime/threads.c (DM_NVN_THREADNAMES); this reads the name back.
+static void texels_slow_log(uint64_t ns) {
+    static const uint64_t THRESH_NS = 5000000ull;   // 5 ms in one call
+    if (ns < THRESH_NS) return;
+    static uint64_t last_frame;   // at most one line per frame: the log must not become a per-frame cost
+    uint64_t f = g_frame_pub;   // a plain global (not _Atomic), read like the rest of the file reads it
+    if (f == last_frame) return;
+    last_frame = f;
+    char nm[32] = ""; pthread_getname_np(pthread_self(), nm, sizeof nm);
+    LOG("[nvn] WriteTexels %.1f ms na thread「%s」", ns / 1e6, nm[0] ? nm : "(sem nome)");
+}
 static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, ptrdiff_t row, ptrdiff_t img) {
     int bw, bh, bpb = nvn_fmt_bpb(o->d.format, &bw, &bh);
     uint32_t wb = (uint32_t)((r->width + bw - 1) / bw) * bpb, hb = (uint32_t)(r->height + bh - 1) / bh;
@@ -514,7 +527,9 @@ static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r
     {   // TOTK (2026-10-20): the time inside the texel write, so it can be told apart from the re-upload
         uint64_t w0 = now_ns();
         mtl_write_texels(o, level, layer0, r, src, (size_t)row, (size_t)img);
-        atomic_fetch_add(&g_texels_ns, now_ns() - w0);
+        uint64_t d = now_ns() - w0;
+        atomic_fetch_add(&g_texels_ns, d);
+        texels_slow_log(d);
     }
 }
 NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src) {
@@ -2938,15 +2953,23 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             // different quantities: the linear bytes the round trip copies, and the block-linear bytes it touches
             // in the pool. The gap between them is the dispersion that makes it slow. @wt_gob_calls separates the
             // textures that took move()'s GOB branch from the linear ones, whose round trip is already cheap.
+            // The four @wt_*_us fields split the round trip by phase: which half is the expensive one decides
+            // the shape of the fix (a symmetric round trip has to lose both halves). They add up to @texels_us
+            // less the region's own copy and the bookkeeping.
             uint64_t wc, wr, wl, wg, wgc; mtl_texels_stats(&wc, &wr, &wl, &wg, &wgc);
-            static uint64_t pwc, pwr, pwl, pwg, pgg;
+            uint64_t wd, ws, wa, wcp; mtl_texels_split_ns(&wd, &ws, &wa, &wcp);
+            static uint64_t pwc, pwr, pwl, pwg, pgg, pwd, pws, pwa, pwcp;
             trow(f, "@texels_us", (double)atomic_exchange(&g_texels_ns, 0) / 1e3);
             trow(f, "@wt_calls", (double)(wc - pwc));
             trow(f, "@wt_region_mb", (double)(wr - pwr) / 1048576.0);
             trow(f, "@wt_level_lin_mb", (double)(wl - pwl) / 1048576.0);
             trow(f, "@wt_level_gob_mb", (double)(wg - pwg) / 1048576.0);
             trow(f, "@wt_gob_calls", (double)(wgc - pgg));
-            pwc = wc; pwr = wr; pwl = wl; pwg = wg; pgg = wgc;
+            trow(f, "@wt_desw_us", (double)(wd - pwd) / 1e3);
+            trow(f, "@wt_swiz_us", (double)(ws - pws) / 1e3);
+            trow(f, "@wt_alloc_us", (double)(wa - pwa) / 1e3);
+            trow(f, "@wt_copy_us", (double)(wcp - pwcp) / 1e3);
+            pwc = wc; pwr = wr; pwl = wl; pwg = wg; pgg = wgc; pwd = wd; pws = ws; pwa = wa; pwcp = wcp;
         }
         static uint64_t pmc, pmp, pmn; uint64_t mc_, mpg_, mn_; nvn_dirty_mp_stats(&mc_, &mpg_, &mn_);
         trow(f, "@mprotect_calls", (double)(mc_ - pmc)); trow(f, "@mprotect_pages", (double)(mpg_ - pmp)); trow(f, "@mprotect_ms", (mn_ - pmn) / 1e6); pmc = mc_; pmp = mpg_; pmn = mn_;
