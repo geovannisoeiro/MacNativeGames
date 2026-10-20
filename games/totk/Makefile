@@ -438,3 +438,11 @@ test-opus-codec:
 	"$(OPUS_TEST_WORK)/probe"
 	@probe_status=0; "$(OPUS_TEST_WORK)/probe" --bad-range > "$(OPUS_TEST_WORK)/negative-range.log" 2>&1 || probe_status=$$?; test "$$probe_status" -eq 1
 	@grep -q 'Opus stream integrity' "$(OPUS_TEST_WORK)/negative-range.log"
+
+.PHONY: probe-borda-identidade
+# CPU only: a identidade da borda — a string que a linha gravada leva, o hash que a chave leva, e
+# o round trip entre os dois. Exercita as funcoes reais (o cabecalho que o port usa).
+probe-borda-identidade:
+	@mkdir -p build analysis
+	xcrun clang -std=gnu11 -O1 -Wall -Wextra -Werror -Wno-unused-function -Ithird_party/d2r_gfx/gfx/nvn -Ithird_party/d2r_gfx/gfx/nvn/include tests/borda_identidade/probe.c -o build/borda-identidade-probe
+	build/borda-identidade-probe | tee analysis/borda-identidade-probe.log

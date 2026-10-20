@@ -5835,46 +5835,13 @@ static void border_stage_init(border_stage *b) {   // the struct holds an object
 static void border_id_str(char *buf, size_t cap, NSString *vk, NSString *fk) {
     snprintf(buf, cap, "V%s|F%s", vk ? vk.UTF8String : "", fk ? fk.UTF8String : "");
 }
-static uint64_t border_id_hash(const char *s) {   // FNV-1a 64
-    uint64_t h = 1469598103934665603ull;
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) { h ^= *p; h *= 1099511628211ull; }
-    return h ? h : 1;   // 0 means "no border"
-}
-// The recorded identity string -> the two stage keys. 0 on success.
+// The recorded identity string -> the two stage keys (the split is in C, no cabecalho, para o probe).
 static int border_id_split(const char *id, NSString **vk, NSString **fk) {
-    if (!id || id[0] != 'V') return -1;
-    const char *bar = strchr(id, '|');
-    if (!bar) return -1;
-    NSString *v = [[NSString alloc] initWithBytes:id + 1 length:(size_t)(bar - id - 1) encoding:NSUTF8StringEncoding];
-    NSString *f = [[NSString alloc] initWithBytes:bar + 1 length:strlen(bar + 1) encoding:NSUTF8StringEncoding];
+    char vb[1024], fb[1024];
+    if (border_id_split_c(id, vb, sizeof vb, fb, sizeof fb)) return -1;
+    NSString *v = [NSString stringWithUTF8String:vb], *f = [NSString stringWithUTF8String:fb];
     if (!v || !f) return -1;
     *vk = v; *fk = f; return 0;
-}
-// "12:0x1p-1,0x1p-1,0x1p-1,0x1p-1;" -> the argument id and the colour of one sampler. The colour is
-// written by border_key with "%a" (a hex float), which strtof reads back exactly.
-static int border_parse(const char *key, float colours[][4], int aids[], int *n) {
-    *n = 0;
-    if (!key) return -1;
-    const char *p = key;
-    while (*p && *n < 8) {
-        char *end = NULL;
-        long aid = strtol(p, &end, 10);
-        if (end == p || *end != ':') return -1;
-        p = end + 1;
-        for (int c = 0; c < 4; c++) {
-            char *e2 = NULL;
-            float v = strtof(p, &e2);
-            if (e2 == p) return -1;
-            colours[*n][c] = v;
-            p = e2;
-            if (c < 3) { if (*p != ',') return -1; p++; }
-        }
-        aids[*n] = (int)aid;
-        ++*n;
-        if (*p != ';') return -1;
-        p++;
-    }
-    return *n > 0 ? 0 : -1;
 }
 static NSString *border_src(NvShader *sh, NSString *src0, float colours[][4], const int aids[], int n) {
     NSString *src = src0; int patched = 0;
