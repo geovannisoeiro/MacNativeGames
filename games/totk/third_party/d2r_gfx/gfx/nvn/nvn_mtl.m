@@ -6594,6 +6594,13 @@ static void warm_load_keys(NSArray<NSString *> *keys, NSArray<NSNumber *> *stage
             if (!sh) { warm_fail(key); continue; }
             os_unfair_lock_lock(&wp->lock); dict[key] = sh; os_unfair_lock_unlock(&wp->lock);
         }
+        // TOTK (2026-10-21): the warm-up is over for this thread, and the GCD will reuse it for
+        // whatever comes next. The census classifies by NAME, so a thread still called "nvn-warm"
+        // has its post-warm-up CPU attributed to the warm-up — which is how the census ended up
+        // naming the warm-up in frames long after it had finished (the warm-up ends around frame
+        // 384, the census named it up to frame 2089). The name goes back to neutral: from here
+        // on this thread is the pool's, not the warm-up's.
+        if (w) pthread_setname_np("gcd-pool");
     });
     free(wp);
 }
