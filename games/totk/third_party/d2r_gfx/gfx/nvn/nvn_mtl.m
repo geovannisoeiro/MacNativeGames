@@ -4769,6 +4769,7 @@ static _Atomic int g_warm_running;   // 后台预热还没跑完（进局读取�
 static _Atomic int g_warm_priority_done;
 static _Atomic uint64_t g_warm_library_ns,g_warm_library_count,g_warm_pipeline_ns,g_warm_pipeline_count;
 static uint64_t g_warm_rps, g_warm_cps, g_warm_skip_fz, g_warm_skip_border;
+static _Atomic uint64_t g_warm_border_built;   // TOTK (2026-10-21): border variants rebuilt from the recorded identity
 // TOTK (2026-10-20): por que o warm-up saltou uma linha. Sem isto o salto e silencioso, e a unica pista e o
 // contador de shaders em falta — que nao diz se a linha saltada era uma pipeline que o jogo ia pedir.
 static uint64_t g_warm_skip_missing, g_warm_skip_parse, g_warm_skip_other;
@@ -5907,6 +5908,63 @@ static NSString *border_key(NvShader *sh, int stage, float colours[][4], int aid
     if (key) sh->border_seen = 1;
     return key;
 }
+// TOTK (2026-10-21): the identity of a border variant, so that the warm-up can rebuild the EXACT
+// variant the game will ask for — and so that the game finds it and does not compile it in play.
+// The identity is the border_key string of the stage ("aid:r,g,b,a;" per sampler: which argument
+// ids, which colour). It travels in the key as a HASH, never as a pointer: the patch caches
+// (fs->bpatch / vs->vpatch) are per NvShader INSTANCE, and the warm-up and the game do not share
+// instances, so a pointer in the key could never match (that is what the reverted attempt did wrong).
+typedef struct { NSString *key; float colours[8][4]; int aids[8]; int n; } border_stage;
+static void border_stage_init(border_stage *b) {   // the struct holds an object pointer: zero the fields, not the bytes
+    b->key = nil; memset(b->colours, 0, sizeof b->colours); memset(b->aids, 0, sizeof b->aids); b->n = 0;
+}
+// The identity of the pair of stages. The border_key only contains ';', ',', ':', digits and hex
+// floats — never '|' — so the split is unambiguous. The string is what the recorded row carries and
+// what the hash is taken over.
+static void border_id_str(char *buf, size_t cap, NSString *vk, NSString *fk) {
+    snprintf(buf, cap, "V%s|F%s", vk ? vk.UTF8String : "", fk ? fk.UTF8String : "");
+}
+static uint64_t border_id_hash(const char *s) {   // FNV-1a 64
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) { h ^= *p; h *= 1099511628211ull; }
+    return h ? h : 1;   // 0 means "no border"
+}
+// The recorded identity string -> the two stage keys. 0 on success.
+static int border_id_split(const char *id, NSString **vk, NSString **fk) {
+    if (!id || id[0] != 'V') return -1;
+    const char *bar = strchr(id, '|');
+    if (!bar) return -1;
+    NSString *v = [[NSString alloc] initWithBytes:id + 1 length:(size_t)(bar - id - 1) encoding:NSUTF8StringEncoding];
+    NSString *f = [[NSString alloc] initWithBytes:bar + 1 length:strlen(bar + 1) encoding:NSUTF8StringEncoding];
+    if (!v || !f) return -1;
+    *vk = v; *fk = f; return 0;
+}
+// "12:0x1p-1,0x1p-1,0x1p-1,0x1p-1;" -> the argument id and the colour of one sampler. The colour is
+// written by border_key with "%a" (a hex float), which strtof reads back exactly.
+static int border_parse(const char *key, float colours[][4], int aids[], int *n) {
+    *n = 0;
+    if (!key) return -1;
+    const char *p = key;
+    while (*p && *n < 8) {
+        char *end = NULL;
+        long aid = strtol(p, &end, 10);
+        if (end == p || *end != ':') return -1;
+        p = end + 1;
+        for (int c = 0; c < 4; c++) {
+            char *e2 = NULL;
+            float v = strtof(p, &e2);
+            if (e2 == p) return -1;
+            colours[*n][c] = v;
+            p = e2;
+            if (c < 3) { if (*p != ',') return -1; p++; }
+        }
+        aids[*n] = (int)aid;
+        ++*n;
+        if (*p != ';') return -1;
+        p++;
+    }
+    return *n > 0 ? 0 : -1;
+}
 static NSString *border_src(NvShader *sh, NSString *src0, float colours[][4], const int aids[], int n) {
     NSString *src = src0; int patched = 0;
     for (int i = 0; i < n; i++) {   // SPIRV-Cross: "sampler <name> [[id(<aid>)]]" in the argument struct, used as tex.sample(spvDescriptorSet0.<name>, coord, ...)
@@ -5935,15 +5993,17 @@ static NSString *border_src(NvShader *sh, NSString *src0, float colours[][4], co
                                               sh->key, colours[0][0], colours[0][1], colours[0][2], colours[0][3], patched);
     return [src stringByReplacingCharactersInRange:NSMakeRange(NSMaxRange(r), 0) withString:helper];
 }
-/* The fragment function for the draw's samplers (border_key), nil when none needs the emulation. */
-static id<MTLFunction> fs_fn_border(NvShader *fs, int nodepth) {
-    if (!fs || !sh_has_src(fs)) return nil;
-    float colours[8][4]; int aids[8], n;
-    NSString *key = border_key(fs, 1, colours, aids, &n);
-    if (!key) return nil;
-    if (nodepth && fs->writes_depth) key = [@"nodepth;" stringByAppendingString:key];
+/* The fragment function for the draw's samplers (border_key), nil when none needs the emulation.
+   TOTK (2026-10-21): two entry points. The game asks for the variant of the samplers it has bound
+   right now (fs_fn_border, which reads the runtime); the warm-up asks for the variant of a RECORDED
+   identity (fs_fn_border_for), because at boot there is no draw and no sampler bound. The two meet
+   in the same patch cache, under the same key, so the same source is compiled and the same variant
+   is used — the identity in the pipeline key is the hash of that identity, not this pointer. */
+static id<MTLFunction> fs_fn_border_for(NvShader *fs, int nodepth, NSString *key, float colours[][4], const int aids[], int n) {
+    if (!fs || !key || !sh_has_src(fs)) return nil;
+    NSString *ck = (nodepth && fs->writes_depth) ? [@"nodepth;" stringByAppendingString:key] : key;
     static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT; os_unfair_lock_lock(&lock);
-    id<MTLFunction> fn = fs->bpatch[key];
+    id<MTLFunction> fn = fs->bpatch[ck];
     if (!fn) {
         NSString *src = border_src(fs, nodepth && fs->writes_depth ? fs_src_without_depth(fs) : sh_src(fs), colours, aids, n);
         if (!src) { os_unfair_lock_unlock(&lock); return nil; }
@@ -5951,16 +6011,25 @@ static id<MTLFunction> fs_fn_border(NvShader *fs, int nodepth) {
         fn = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
         if (!fn) MDIE("fragment shader %s with emulated sampler border colour: %s", fs->key, err.localizedDescription.UTF8String);
         if (!fs->bpatch) fs->bpatch = [NSMutableDictionary dictionary];
-        fs->bpatch[key] = fn;
+        fs->bpatch[ck] = fn;
     }
     os_unfair_lock_unlock(&lock);
     return fn;
 }
-static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int border) {
+static id<MTLFunction> fs_fn_border(NvShader *fs, int nodepth) {
+    if (!fs || !sh_has_src(fs)) return nil;
+    float colours[8][4]; int aids[8], n;
+    NSString *key = border_key(fs, 1, colours, aids, &n);
+    if (!key) return nil;
+    return fs_fn_border_for(fs, nodepth, key, colours, aids, n);
+}
+/* The vertex function for the draw (the varying patch, the layered pass, and the border emulation).
+   TOTK (2026-10-21): as with the fragment, the game asks for the variant of the samplers it has bound
+   right now (vs_fn_for), and the warm-up asks for a RECORDED identity (vs_fn_for_key). The two meet in
+   the same patch cache, under the same key, so the warm-up's variant is the one the game would build. */
+static id<MTLFunction> vs_fn_for_key(NvShader *vs, NvShader *fs, int layered, NSString *bkey, float bc[][4], const int ba[], int bn) {
     static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
     if (layered && !vs_layerable(vs)) MDIE("vertex shader %s cannot write the render target array index", vs->key);
-    float bc[8][4]; int ba[8], bn = 0;   // TOTK: vertex-stage samplers with a border colour Metal lacks (PSO_VBORDER)
-    NSString *bkey = border && sh_has_src(vs) ? border_key(vs, 0, bc, ba, &bn) : nil;
     if (!sh_has_src(vs) || (!layered && !bkey && (!fs || !sh_has_src(fs)))) return vs->fn;
     os_unfair_lock_lock(&lk);
     NSDictionary *in = fs && sh_has_src(fs) ? msl_varyings(fs) : nil, *out = in ? msl_varyings(vs) : nil;
@@ -6003,6 +6072,11 @@ static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int bo
     }
     os_unfair_lock_unlock(&lk);
     return f;
+}
+static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int border) {
+    float bc[8][4]; int ba[8], bn = 0;   // TOTK: vertex-stage samplers with a border colour Metal lacks (PSO_VBORDER)
+    NSString *bkey = border && sh_has_src(vs) ? border_key(vs, 0, bc, ba, &bn) : nil;
+    return vs_fn_for_key(vs, fs, layered, bkey, bc, ba, bn);
 }
 // MSL of a depth-exporting fragment function with the depth output kept as a local (see fs_fn_without_depth).
 static NSString *fs_src_without_depth(NvShader *fs) {
@@ -6153,9 +6227,15 @@ static void nan_trace_bind(id<MTL4RenderCommandEncoder> en) {
     }
     enc_r_args(en, MTLRenderStageFragment, buf.gpuAddress + (uint64_t)(fr % NT_SLOTS) * NT_SLOT_WORDS * 4, 29);
 }
-static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
+// TOTK (2026-10-21): vbs carries the border identity of the VERTEX stage (nil when the stage has no
+// border sampler). With it, the vertex function is the variant of that identity; without it, the
+// variant is taken from the runtime (the game), as before. The warm-up always passes one when the
+// row describes a border pipeline — never the runtime, which at boot has no draw to read.
+static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged, const border_stage *vbs) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-    d.vertexFunction = vs_fn_for(vs, fs, (k->a2c & PSO_LAYERED) != 0, (k->a2c & PSO_VBORDER) != 0); d.fragmentFunction = fsfn ? fsfn : fs ? (k->dfmt ? fs->fn : fs_fn_without_depth(fs)) : nil;
+    d.vertexFunction = (vbs && vbs->key) ? vs_fn_for_key(vs, fs, (k->a2c & PSO_LAYERED) != 0, vbs->key, vbs->colours, vbs->aids, vbs->n)
+                                          : vs_fn_for(vs, fs, (k->a2c & PSO_LAYERED) != 0, (k->a2c & PSO_VBORDER) != 0);
+    d.fragmentFunction = fsfn ? fsfn : fs ? (k->dfmt ? fs->fn : fs_fn_without_depth(fs)) : nil;
     if (!fsfn && nan_trace_match(fs) && !fs->writes_depth) d.fragmentFunction = nan_trace_fn(fs);   // diagnostic TOTK_NAN_TRACE
     // 诊断 DM_NVN_HILITE=片元着色器键,…：这些绘制改用纯色片元（第 1–6 个键依次 品红 / 绿 / 青 / 黄 / 蓝 / 白），看几何落在哪里
     // Diagnostic DM_NVN_HILITE=fragment shader key,...: these draws use a solid-color fragment instead (keys 1–6 in order magenta / green / cyan / yellow / blue / white), to see where the geometry lands
@@ -6294,7 +6374,7 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // �
     if (at < 0 && slot < 0) g_pp_full++;
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
-    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++;
+    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0, nil); g_pp_kicked++;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
         pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
@@ -6325,9 +6405,23 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (g_pass.layered) k.a2c |= PSO_LAYERED;   // TOTK: layered pass (see g_lay)
     if (g_mfx.role) k.a2c |= (uint32_t)g_mfx.role << 2;   // TOTK_MFX: scene / UI copy variant (see pso_desc)
     if (g_pso_lmap) { memcpy(k.lmap, g_pso_lmap, 8); k.fsfn = (__bridge void *)g_pso_fsfn; }
-    __unsafe_unretained id<MTLFunction> bfn = !g_pso_lmap && !g_mfx.role ? fs_fn_border(fs, k.dfmt == 0) : nil;   // TOTK: sampler border colour emulation
-    if (bfn) k.fsfn = (__bridge void *)bfn;
-    { float bc[8][4]; int ba[8], bn; if (border_key(vs, 0, bc, ba, &bn)) k.a2c |= PSO_VBORDER; }
+    // TOTK (2026-10-21): the border variant. Its identity (which samplers, which colour) travels in
+    // the key as a HASH (k.bid), never as a pointer: the patch caches are per shader INSTANCE and the
+    // warm-up and the game do not share instances, so a pointer in the key could never match. k.fsfn
+    // therefore stays NULL for a border pipeline — the fragment's border function goes to the
+    // descriptor, not to the key — and the identity string is kept to be recorded with the row.
+    border_stage vbs, fbs; border_stage_init(&vbs); border_stage_init(&fbs);
+    char bidstr[2048]; bidstr[0] = 0;   // two stages of up to 8 samplers each: the identity string
+    __unsafe_unretained id<MTLFunction> bfn = nil;
+    if (!g_pso_lmap && !g_mfx.role) {   // TOTK: sampler border colour emulation
+        float fc[8][4]; int fa[8], fn = 0;
+        NSString *fk = border_key(fs, 1, fc, fa, &fn);
+        if (fk) { bfn = fs_fn_border_for(fs, k.dfmt == 0, fk, fc, fa, fn); fbs.key = fk; memcpy(fbs.colours, fc, sizeof fc); memcpy(fbs.aids, fa, sizeof fa); fbs.n = fn; }
+        float vc[8][4]; int va[8], vn = 0;
+        NSString *vk = border_key(vs, 0, vc, va, &vn);
+        if (vk) { vbs.key = vk; memcpy(vbs.colours, vc, sizeof vc); memcpy(vbs.aids, va, sizeof va); vbs.n = vn; k.a2c |= PSO_VBORDER; }
+        if (fk || vk) { border_id_str(bidstr, sizeof bidstr, vk, fk); k.bid = border_id_hash(bidstr); }
+    }
     __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
     if (cached) return cached;
     id<MTLRenderPipelineState> ps;
@@ -6336,7 +6430,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (ps) g_pp_taken++;
     else {
         if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
-        MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, bfn ? bfn : g_pso_fsfn, g_pso_lmap != NULL);
+        MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, bfn ? bfn : g_pso_fsfn, g_pso_lmap != NULL, &vbs);
         ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
         // TOTK (2026-10-20): por que esta pipeline nao estava pronta? O warm-up devia tê-la compilado. Se os shaders
         // dela nao estao no cache de traducao, o warm-up saltou a linha (cobertura em falta). Se estao, a pipeline
@@ -6364,7 +6458,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     // The real fix is for the key to carry the border IDENTITY (the border_key string: the argument ids and
     // the colours), so the warm-up can rebuild the exact variant; until then the border pipelines are built
     // in play, as before, and the counter says how many that is.
-    pso_key rk = k; rk.a2c &= ~PSO_VBORDER; if (bfn) rk.fsfn = NULL;
+    pso_key rk = k; rk.a2c &= ~PSO_VBORDER; rk.bid = 0; if (bfn) rk.fsfn = NULL;
     // TOTK (2026-10-20): how many of the pipelines the game builds in play need the border variant.
     // It is the number that decides whether pre-warming them is worth the warm-up's time.
     if (k.a2c & PSO_VBORDER) atomic_fetch_add(&g_pso_border, 1);
@@ -6372,6 +6466,15 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (survey_shader_log()) MLOG("[survey-shader] frame %llu render pipeline %s in %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), shex, (bp_now() - bt) / 1e6);
     pso_record("R\t%s\n", shex);
     pso_user_record("R\t%s\n", shex);
+    // TOTK (2026-10-21): the BORDER row — the same pipeline, with the border identity in the key and
+    // the identity itself in a third column, so that the warm-up can rebuild the exact variant instead
+    // of the game compiling it in play. The warm-up verifies that the hash in the key is the hash of
+    // this column, and skips the row if they disagree.
+    if (k.bid) {
+        pso_skey bsk; char bhex[sizeof bsk * 2 + 1]; pso_skey_from(&k, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL, &bsk); pso_skey_hex(&bsk, bhex);
+        pso_record("R\t%s\t%s\n", bhex, bidstr);
+        pso_user_record("R\t%s\t%s\n", bhex, bidstr);
+    }
     hm_put_id(&g_pso, &k, ps);
     return ps;
 }
@@ -6617,24 +6720,46 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                         NvShader *fs = fkey.length ? warm_shader(dict, fkey, sk.fs_stage) : nil;
                         if (!vs || (fkey.length && !fs)) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                         id<MTLFunction> fsfn = nil;
+                        border_stage vbs; border_stage_init(&vbs);
                         if (sk.fz) {
                             if (sk.fz_desc.kind == 1 && fs) { int fx[32]; for (int i = 0; i < 32; i++) fx[i] = sk.fz_desc.fx[i]; fsfn = bf_fn(fs, fx, sk.fz_desc.fbmask, sk.k.lmap); }
                                                     if (!fsfn) { g_warm_skip_fz++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                        } else if (sk.k.bid) {
+                            // TOTK (2026-10-21): a border pipeline, with its identity. The third column of the
+                            // row is the identity ("V<vertex key>|F<fragment key>") and the key carries its hash;
+                            // the two must agree, or the row is not trusted and the pipeline is left to the game.
+                            // The variant is rebuilt FROM THE IDENTITY: border_src() is a pure function of the
+                            // shader and the identity, so the warm-up compiles the same variant the game would
+                            // have compiled in play. The identity in the key is the hash, not a pointer, because
+                            // the patch caches are per shader instance and the two sides do not share instances.
+                            if (c.count < 3 || !c[2].length || border_id_hash(c[2].UTF8String) != sk.k.bid) { g_warm_skip_border++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                            NSString *ivk = nil, *ifk = nil;
+                            if (border_id_split(c[2].UTF8String, &ivk, &ifk)) { g_warm_skip_border++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                            if (ivk.length) {
+                                float bc[8][4]; int ba[8], bn = 0;
+                                if (border_parse(ivk.UTF8String, bc, ba, &bn)) { g_warm_skip_border++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                                vbs.key = ivk; memcpy(vbs.colours, bc, sizeof bc); memcpy(vbs.aids, ba, sizeof ba); vbs.n = bn;
+                            }
+                            if (ifk.length) {
+                                float fc[8][4]; int fa[8], fn = 0;
+                                if (border_parse(ifk.UTF8String, fc, fa, &fn)) { g_warm_skip_border++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                                fsfn = fs_fn_border_for(fs, sk.k.dfmt == 0, ifk, fc, fa, fn);
+                                if (!fsfn) { g_warm_skip_border++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                            }
+                            if (vbs.key && !vs_fn_for_key(vs, fs, (sk.k.a2c & PSO_LAYERED) != 0, vbs.key, vbs.colours, vbs.aids, vbs.n)) { g_warm_skip_border++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                            atomic_fetch_add(&g_warm_border_built, 1);
                         } else if ((sk.k.a2c & PSO_VBORDER) && fs && !sk.merged && !(sk.k.a2c >> 2 & 3)) {
-                            // TOTK (2026-10-20): a border pipeline cannot be rebuilt here. border_key() reads
-                            // the samplers the draw has bound and their border colours; at boot no draw has
-                            // bound anything, so it returns nil and the call below would hand back nil -- the
-                            // warm-up would build the PLAIN pipeline and store it under the border key, and the
-                            // game (whose key for a vertex-stage border is {bit, fsfn=nil, vs, fs}) would hit
-                            // it and draw with a vertex shader that does not emulate the border colour.
-                            // Until the key carries the border identity, the border rows are skipped: the
-                            // pipeline is built in play, as before.
+                            // TOTK (2026-10-21): a border row WITHOUT an identity (a row written by an older
+                            // build, which cleared the bit and the fsfn, or a truncated one). It cannot be
+                            // rebuilt, and building the plain variant under the border key would hand the game
+                            // a pipeline that does not emulate the border colour. Skip it: the pipeline is built
+                            // in play, as before.
                             g_warm_skip_border++;
                             warm_task_done(&done,total,shader_total,pipeline_total,dict); continue;
                         }
-                        pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fsfn;
+                        pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)(sk.fz ? fsfn : NULL);
                         NSError *e = nil; uint64_t ps_started = bp_now();
-                        id ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, fsfn, sk.merged) error:&e];
+                        id ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, fsfn, sk.merged, &vbs) error:&e];
                         atomic_fetch_add(&g_warm_pipeline_ns, bp_now() - ps_started); atomic_fetch_add(&g_warm_pipeline_count, 1);
                         if (!ps) { MLOG("【红】后台建渲染管线失败：%s", e.localizedDescription.UTF8String); warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                         WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = vkey; item->fs_key = fkey; item->vs = vs; item->fs = fs; item->fsfn = fsfn; item->pso = k; item->object = ps;
@@ -6707,7 +6832,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
         // TOTK (2026-10-20): as linhas de borda entram na conta: uma pipeline de borda nao se reconstroi no boot
         // (o estado de runtime nao existe), e sem a identidade da borda na chave o warm-up construiria a pipeline
         // plain e o jogo acertaria nela com o vertex shader errado.
-        MLOG("预热跳过：缺着色器 %llu 行，键解析失败 %llu 行，边框变体 %llu 行，其他 %llu 行", g_warm_skip_missing, g_warm_skip_parse, g_warm_skip_border, g_warm_skip_other);
+        MLOG("预热跳过：缺着色器 %llu 行，键解析失败 %llu 行，边框变体 %llu 行（已重建 %llu），其他 %llu 行", g_warm_skip_missing, g_warm_skip_parse, g_warm_skip_border, (unsigned long long)atomic_load(&g_warm_border_built), g_warm_skip_other);
         MLOG("管线预热完成：着色器 %llu 个 / 渲染管线 %llu 个（跳过特化片元 %llu）/ 计算管线 %llu 个，后台用时 %.1f ms（着色器库 %d 个线程%s）",
              (unsigned long long)dict.count, g_warm_rps, g_warm_skip_fz, g_warm_cps, (bp_now() - g_warm_t0) / 1e6, warm_threads(),
              atomic_load(&g_warm_in_play) && warm_threads() > 2 ? "，进世界后 2 个" : "");
@@ -6794,7 +6919,7 @@ static void warm_light(void) {
                 NvShader *vs = vkey.length ? warm_shader(dict, vkey, sk.vs_stage) : nil, *fs = fkey.length ? warm_shader(dict, fkey, sk.fs_stage) : nil;
                 if (!vs || (fkey.length && !fs)) { nfail++; continue; }
                 pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = NULL;
-                NSError *er = nil; ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, nil, sk.merged) error:&er]; tried = 1; nr += ps != nil;
+                NSError *er = nil; ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, nil, sk.merged, nil) error:&er]; tried = 1; nr += ps != nil;
             } else if ([c[0] isEqualToString:@"C"] && c.count >= 2 && [c[1] length]) {
                 NvShader *cs = warm_shader(dict, c[1], 5); if (!cs) { nfail++; continue; }
                 NSError *er = nil; ps = [g_dev newComputePipelineStateWithFunction:cs->fn error:&er]; tried = 1; nc += ps != nil;
@@ -13035,7 +13160,7 @@ int mtl_probe_depth_output(void) {
     for (int hasDepth = 0; hasDepth < 2; hasDepth++) {
         pso_key k = {0}; k.cfmt[0] = MTLPixelFormatRGBA8Unorm; k.samples = 1; k.chmask = 15;
         k.dfmt = hasDepth ? MTLPixelFormatDepth32Float : 0;
-        MTLRenderPipelineDescriptor *pd = pso_desc(&k, vs, fs, nil, 0);
+        MTLRenderPipelineDescriptor *pd = pso_desc(&k, vs, fs, nil, 0, nil);
         if (!hasDepth && getenv("TOTK_PROBE_NEGATIVE")) pd.fragmentFunction = fs->fn;
         id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
         if (!ps) MDIE("depth output probe pipeline: %s", err.localizedDescription.UTF8String);
@@ -14130,7 +14255,7 @@ int mtl_probe_vertex_streams(void) {
         for(unsigned i=0;i<15;i++){S.stream[i].stride=16;S.vbuf[i]=(NVNbufferRange){.address=(uint64_t)(uintptr_t)mem+512,.size=48};}
         S.vbuf[2].address=(uint64_t)(uintptr_t)mem;S.vbuf[scenario==1?7:5].address=(uint64_t)(uintptr_t)mem+256;
         uint32_t formats[8]={MTLPixelFormatRGBA8Unorm};pso_key key;pso_key_fill(&key,vs,fs,formats,0,0,1,0);key.chmask=15;
-        MTLRenderPipelineDescriptor *pd=pso_desc(&key,vs,fs,nil,0);
+        MTLRenderPipelineDescriptor *pd=pso_desc(&key,vs,fs,nil,0,nil);
         id<MTLRenderPipelineState> ps=[g_dev newRenderPipelineStateWithDescriptor:pd error:&error];if(!ps)MDIE("vertex stream probe pipeline: %s",error.localizedDescription.UTF8String);
         MTL4RenderPassDescriptor *rp=[MTL4RenderPassDescriptor new];rp.colorAttachments[0].texture=texture;rp.colorAttachments[0].loadAction=MTLLoadActionClear;rp.colorAttachments[0].storeAction=MTLStoreActionStore;
         rp.renderTargetWidth=rp.renderTargetHeight=16;id<MTL4RenderCommandEncoder> en=enc_r_begin(rp);enc_r_pso(en,ps);enc_r_cull(en,MTLCullModeNone);
