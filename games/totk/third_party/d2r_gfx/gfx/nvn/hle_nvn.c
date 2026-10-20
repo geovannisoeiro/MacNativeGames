@@ -2649,13 +2649,16 @@ static void tsummary(uint64_t frame) {
 // DM_SLOWFRAME=1 (test switch, read over the log port on a real device): per-frame timings are first stored in a ring of the last 16 frames; dropped frames are judged 8 frames late (GPU / on-screen present times are back by then),
 // and only for dropped frames is one line "[slowframe]\t<frame number>\t@<name>=<value>..." written to the log, plus one denominator line every 300 frames. No per-frame file is written: the log tee fsyncs every line, and writing line by line would disturb the readings
 #define SRN 16
-static struct { uint64_t f; int n; const char *k[64]; double v[64]; } g_sr[SRN];
+// TOTK (2026-10-21): o anel aceitava 64 entradas por quadro e a sessao do dono ja levava 60 (com o
+// split ligado). A capacidade sobe para 96: 16 quadros x 96 x 16 bytes = 24 KB, e o limite deixa de
+// ser a proxima coisa que rebenta quando se acrescenta uma metrica.
+static struct { uint64_t f; int n; const char *k[96]; double v[96]; } g_sr[SRN];
 static int g_slow = -1;
 static int slow_on(void) { if (g_slow < 0) g_slow = getenv("DM_SLOWFRAME") != NULL; return g_slow; }
 static int frame_rec(void) { return g_tsv || slow_on(); }
 static void trow(uint64_t f, const char *name, double v) {
     if (g_tsv) fprintf(g_tsv, "%llu\t%s\t%.3f\n", f, name, v);
-    if (slow_on()) { __typeof__(g_sr[0]) *r = &g_sr[f % SRN]; if (r->f != f) { r->f = f; r->n = 0; } if (r->n < 64) { r->k[r->n] = name; r->v[r->n++] = v; } }
+    if (slow_on()) { __typeof__(g_sr[0]) *r = &g_sr[f % SRN]; if (r->f != f) { r->f = f; r->n = 0; } if (r->n < 96) { r->k[r->n] = name; r->v[r->n++] = v; } }
 }
 static double srow(uint64_t f, const char *name, double dflt) {
     __typeof__(g_sr[0]) *r = &g_sr[f % SRN];
@@ -2979,6 +2982,10 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             // only pre-warm them if the recorded key says so, and the bit now survives the recording.
             {   static uint64_t pbd; uint64_t bd; mtl_pso_border_stats(&bd);
                 trow(f, "@pso_border", (double)(bd - pbd)); pbd = bd; }
+            // TOTK (2026-10-21): as pipelines criadas em jogo com uma IDENTIDADE de borda (as duas etapas).
+            // O @pso_border so conta as de vertice (o bit PSO_VBORDER e do vertice); este conta o total.
+            {   static uint64_t pbi; uint64_t bi; mtl_pso_bid_stats(&bi);
+                trow(f, "@pso_bid", (double)(bi - pbi)); pbi = bi; }
             pwc = wc; pwr = wr; pwl = wl; pwg = wg; pgg = wgc; pwd = wd; pws = ws; pwa = wa; pwcp = wcp;
             // The four split rows are a diagnostic (DM_NVN_TEXEL_SPLIT) and they cost four of the ring's
             // 64 entries per frame, so they are only written when the split is on. Without the flag they
