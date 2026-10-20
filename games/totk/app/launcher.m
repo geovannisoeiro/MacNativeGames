@@ -119,6 +119,19 @@ static void note(NSString *text) {
     [alert runModal];
 }
 
+/* TOTK (2026-10-20): a run without a human at the keyboard must never be stopped by a dialog.
+   The reminder below is the player's CONSENT to send the shaders to GitHub, so it stays for a human
+   session -- but it is a modal alert, and a modal alert in an automated run is a false negative: the
+   game never starts, the harness waits, and the run is read as "the game hung".
+   A run declares itself automated with the command channel (TOTK_INPUT_FILE) or a slot owner that is
+   not "user" (the launcher sets "user" with overwrite=0, so a value set outside survives). */
+static int run_is_unattended(void) {
+    const char *owner = getenv("TOTK_SLOT_OWNER");
+    if (owner && *owner && strcmp(owner, "user") != 0) return 1;
+    if (getenv("TOTK_INPUT_FILE") && *getenv("TOTK_INPUT_FILE")) return 1;
+    return 0;
+}
+
 /* Every TOTK_CONTRIB_STEP shaders the shared list does not have yet (totk_shader_contrib.h), before the game starts: ask
    the player to send the file in a GitHub issue. "Send" opens the issue form and shows the file in Finder to drag in.
    With gh signed in, "Submit automatically" takes the place of "Remind me next time" and sends this file at once. */
@@ -246,7 +259,9 @@ int main(int argc, char **argv) {
         setenv("TOTK_SLOT_PURPOSE", "player", 0);
         NSString *contrib = env_or("TOTK_SHADER_CONTRIB", [data stringByAppendingPathComponent:@"shader-list-contribution.txt"]);
         setenv("TOTK_SHADER_CONTRIB", contrib.fileSystemRepresentation, 1);
-        contrib_reminder(contrib);
+        // TOTK (2026-10-20): an automated run skips the reminder. The state is NOT touched, so the player's
+        // next interactive launch still asks -- the consent is never spent by a test.
+        if (!run_is_unattended()) contrib_reminder(contrib);
         unsetenv("TOTK_AUTOLOAD");   // the game starts at its title screen, as on the console
         /* runtime command channel (runtime/input.c): echo "shot ~/Desktop/shot.png" >> "<data>/input.txt" */
         { NSString *cmds = env_or("TOTK_INPUT_FILE", [data stringByAppendingPathComponent:@"input.txt"]);
