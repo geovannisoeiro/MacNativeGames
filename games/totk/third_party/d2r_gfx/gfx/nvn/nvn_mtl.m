@@ -4781,7 +4781,7 @@ static uint64_t g_warm_t0;
 static _Atomic int g_warm_running;   // 后台预热还没跑完（进局读取画面据此多等一会儿，见 mtl_warm_wait） | Background warm-up has not finished yet (the loading screen on entering a run waits a little longer based on this, see mtl_warm_wait)
 static _Atomic int g_warm_priority_done;
 static _Atomic uint64_t g_warm_library_ns,g_warm_library_count,g_warm_pipeline_ns,g_warm_pipeline_count;
-static uint64_t g_warm_rps, g_warm_cps, g_warm_skip_fz;
+static uint64_t g_warm_rps, g_warm_cps, g_warm_skip_fz, g_warm_skip_border;
 // TOTK (2026-10-20): por que o warm-up saltou uma linha. Sem isto o salto e silencioso, e a unica pista e o
 // contador de shaders em falta — que nao diz se a linha saltada era uma pipeline que o jogo ia pedir.
 static uint64_t g_warm_skip_missing, g_warm_skip_parse, g_warm_skip_other;
@@ -6434,16 +6434,18 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     }
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
     if (!ps) { static int said; if (said++ < 12) MLOG("【红】建渲染管线失败：%s（vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d）", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("【红】建渲染管线失败：后续不再逐条打印"); return nil; }
-    // TOTK (2026-10-20): the border bit is KEPT in the recorded key. A draw that uses a sampler border
-    // colour needs a pipeline whose fragment function is the border-emulating one (fs_fn_border), and that
-    // function is chosen by a bit in the key -- so a warm-up that knew the bit could build exactly the
-    // pipeline the game will ask for. It could not, because the recording cleared the bit: the warm-up only
-    // ever built the plain pipeline, and the game rebuilt the border one in play (39.4 ms, GPU idle).
-    // fs_fn_border(fs, nodepth) is deterministic and cached per (fs, nodepth), so the warm-up computes the
-    // SAME function pointer the game will use, and the pipeline cache (which hashes the key, pointer
-    // included) finds it. A row recorded before this change has the bit clear and is simply the plain
-    // pipeline, as before: the border rows accumulate as the game meets them.
-    pso_key rk = k; if (bfn) rk.fsfn = NULL;
+    // TOTK (2026-10-20): the recorded key clears the border bit, and that is deliberate. A border pipeline
+    // cannot be rebuilt at boot: border_key() reads the samplers the DRAW has bound (S.samp / S.tex) and
+    // their border colours (g_sreg), and at warm-up time there is no draw and no sampler bound, so it
+    // returns nil and fs_fn_border() / vs_fn_for() hand back the PLAIN functions. Recording the bit would
+    // therefore have the warm-up build the plain pipeline under the border key -- and the game, whose key
+    // for a vertex-stage border (the fragment needs none) is {bit, fsfn=nil, vs, fs}, would HIT it and
+    // draw with a vertex shader that does not emulate the border colour. The bit is kept in the IN-GAME key
+    // (k.a2c), which is what the counter below measures; only the recorded row drops it.
+    // The real fix is for the key to carry the border IDENTITY (the border_key string: the argument ids and
+    // the colours), so the warm-up can rebuild the exact variant; until then the border pipelines are built
+    // in play, as before, and the counter says how many that is.
+    pso_key rk = k; rk.a2c &= ~PSO_VBORDER; if (bfn) rk.fsfn = NULL;
     // TOTK (2026-10-20): how many of the pipelines the game builds in play need the border variant.
     // It is the number that decides whether pre-warming them is worth the warm-up's time.
     if (k.a2c & PSO_VBORDER) atomic_fetch_add(&g_pso_border, 1);
@@ -6695,13 +6697,16 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                             if (sk.fz_desc.kind == 1 && fs) { int fx[32]; for (int i = 0; i < 32; i++) fx[i] = sk.fz_desc.fx[i]; fsfn = bf_fn(fs, fx, sk.fz_desc.fbmask, sk.k.lmap); }
                                                     if (!fsfn) { g_warm_skip_fz++; warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                         } else if ((sk.k.a2c & PSO_VBORDER) && fs && !sk.merged && !(sk.k.a2c >> 2 & 3)) {
-                            // TOTK (2026-10-20): the recorded key says this pipeline is the one with the
-                            // sampler-border-colour emulation. The game builds it with exactly this call, and
-                            // fs_fn_border caches per (fs, nodepth), so both get the same function pointer and
-                            // the pipeline cache (which hashes the key, pointer included) finds this one. If the
-                            // conditions do not match the game's, the game simply builds its own, as before --
-                            // the failure mode is benign.
-                            fsfn = fs_fn_border(fs, sk.k.dfmt == 0);
+                            // TOTK (2026-10-20): a border pipeline cannot be rebuilt here. border_key() reads
+                            // the samplers the draw has bound and their border colours; at boot no draw has
+                            // bound anything, so it returns nil and the call below would hand back nil -- the
+                            // warm-up would build the PLAIN pipeline and store it under the border key, and the
+                            // game (whose key for a vertex-stage border is {bit, fsfn=nil, vs, fs}) would hit
+                            // it and draw with a vertex shader that does not emulate the border colour.
+                            // Until the key carries the border identity, the border rows are skipped: the
+                            // pipeline is built in play, as before.
+                            g_warm_skip_border++;
+                            warm_task_done(&done,total,shader_total,pipeline_total,dict); continue;
                         }
                         pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fsfn;
                         NSError *e = nil; uint64_t ps_started = bp_now();
@@ -6775,7 +6780,10 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
         MLOG("缓存补充预热：新增 %llu 个着色器，%llu 个失败；清单里还不在翻译缓存的着色器 %llu 个（第一次用到时现翻，自动收集）", cached, failed, (unsigned long long)g_warm_missing);
         // TOTK (2026-10-20): quantas linhas o warm-up saltou e por que. O salto era silencioso; a populacao A
         // (pipelines criadas em jogo, 43,7% do tempo de quadro longo na e1) nasce aqui.
-        MLOG("预热跳过：缺着色器 %llu 行，键解析失败 %llu 行，其他 %llu 行", g_warm_skip_missing, g_warm_skip_parse, g_warm_skip_other);
+        // TOTK (2026-10-20): as linhas de borda entram na conta: uma pipeline de borda nao se reconstroi no boot
+        // (o estado de runtime nao existe), e sem a identidade da borda na chave o warm-up construiria a pipeline
+        // plain e o jogo acertaria nela com o vertex shader errado.
+        MLOG("预热跳过：缺着色器 %llu 行，键解析失败 %llu 行，边框变体 %llu 行，其他 %llu 行", g_warm_skip_missing, g_warm_skip_parse, g_warm_skip_border, g_warm_skip_other);
         MLOG("管线预热完成：着色器 %llu 个 / 渲染管线 %llu 个（跳过特化片元 %llu）/ 计算管线 %llu 个，后台用时 %.1f ms（着色器库 %d 个线程%s）",
              (unsigned long long)dict.count, g_warm_rps, g_warm_skip_fz, g_warm_cps, (bp_now() - g_warm_t0) / 1e6, warm_threads(),
              atomic_load(&g_warm_in_play) && warm_threads() > 2 ? "，进世界后 2 个" : "");
