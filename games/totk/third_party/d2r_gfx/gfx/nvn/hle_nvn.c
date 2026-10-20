@@ -2974,15 +2974,23 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             trow(f, "@wt_level_lin_mb", (double)(wl - pwl) / 1048576.0);
             trow(f, "@wt_level_gob_mb", (double)(wg - pwg) / 1048576.0);
             trow(f, "@wt_gob_calls", (double)(wgc - pgg));
-            trow(f, "@wt_desw_us", (double)(wd - pwd) / 1e3);
-            trow(f, "@wt_swiz_us", (double)(ws - pws) / 1e3);
-            trow(f, "@wt_alloc_us", (double)(wa - pwa) / 1e3);
-            trow(f, "@wt_copy_us", (double)(wcp - pwcp) / 1e3);
             pwc = wc; pwr = wr; pwl = wl; pwg = wg; pgg = wgc; pwd = wd; pws = ws; pwa = wa; pwcp = wcp;
+            // The four split rows are a diagnostic (DM_NVN_TEXEL_SPLIT) and they cost four of the ring's
+            // 64 entries per frame, so they are only written when the split is on. Without the flag they
+            // would be four zeros -- and a run that carries 59 rows is close to the 64 the ring accepts.
+            {   static int sflag = -1;
+                if (sflag < 0) { const char *e = getenv("DM_NVN_TEXEL_SPLIT"); sflag = e && atoi(e) > 0; }
+                if (sflag) {
+                    trow(f, "@wt_desw_us", (double)(wd - pwd) / 1e3);
+                    trow(f, "@wt_swiz_us", (double)(ws - pws) / 1e3);
+                    trow(f, "@wt_alloc_us", (double)(wa - pwa) / 1e3);
+                    trow(f, "@wt_copy_us", (double)(wcp - pwcp) / 1e3);
+                }
+            }
             // TOTK (2026-10-20): the in-game identity of the direct region write (TOTK_GOB_VERIFY). The
             // verdict must not depend on someone reading the log for a line. The two rows are only
-            // emitted when the verification is on: the TSV ring accepts 64 entries per frame and a
-            // normal run already carries 59 with the split fields.
+            // emitted when the verification is on: the TSV ring accepts 64 entries per frame, and a
+            // normal run already carries 55.
             {   static int vcheck = -1;
                 if (vcheck < 0) { const char *e = getenv("TOTK_GOB_VERIFY"); vcheck = e && atoi(e) > 0; }
                 if (vcheck) {
