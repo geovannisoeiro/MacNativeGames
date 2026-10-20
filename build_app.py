@@ -834,7 +834,10 @@ def step_app(tree, out, logs, *, version="v0", game='totk'):
                 CFBundleDisplayName=app_name, CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],
                 CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
                 LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
-                GCSupportsControllerUserInteraction=True)
+                GCSupportsControllerUserInteraction=True,
+                # Pin the picture to the game's own 1920x1080 for good: no 2560x1440 swapchain or
+                # DynamicTextureAllocator heap is prepared, so key 3 has nothing to switch to.
+                LSEnvironment=dict(TOTK_OUTPUT_RES='0'))
     icon = tree / 'build/AppIcon.icns'
     if icon.exists():
         clone(icon, tmp / 'Contents/Resources/AppIcon.icns')

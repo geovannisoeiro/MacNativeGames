@@ -196,13 +196,36 @@ static void note_occlusion(const char *when){int v=(window.occlusionState&NSWind
 static TOTKWindowDelegate *windowDelegate;
 int runtime_front_window_visible(void){return atomic_load(&windowVisible);}
 void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(), ^{[window performClose:nil];});}
-/* Use the window-close path, not terminate:, so Command-Q also waits for active saves. */
+/* The one menu bar. Two things it has to get right:
+   - Command-Q goes through the window-close path, not terminate:, so it also waits for active saves.
+   - macOS delivers ⌘M / ⌘W / ⌘⌃F / ⌘H / ⌘Q as main-menu key equivalents, so an app with no menu bar
+     has no window shortcuts at all: the traffic-light buttons work, the keyboard does not. The game
+     matches bare keys by physical position, so nothing here collides with gameplay — only
+     Command-modified keys are intercepted.
+   Installed after the window exists, because the quit item targets it. */
 static void front_install_menu(void){
+ NSString *name=NSProcessInfo.processInfo.processName?:@GAME_NAME;
  NSMenu *menu=[NSMenu new],*appMenu=[NSMenu new];
  NSMenuItem *appItem=[NSMenuItem new];appItem.submenu=appMenu;[menu addItem:appItem];
+ [appMenu addItemWithTitle:[@"Hide " stringByAppendingString:name] action:@selector(hide:) keyEquivalent:@"h"];
+ NSMenuItem *hideOthers=[appMenu addItemWithTitle:@"Hide Others" action:@selector(hideOtherApplications:) keyEquivalent:@"h"];
+ hideOthers.keyEquivalentModifierMask=NSEventModifierFlagCommand|NSEventModifierFlagOption;
+ [appMenu addItemWithTitle:@"Show All" action:@selector(unhideAllApplications:) keyEquivalent:@""];
+ [appMenu addItem:NSMenuItem.separatorItem];
  NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("退出 " GAME_NAME,"Quit " GAME_NAME,"Sair do " GAME_NAME)) action:@selector(performClose:) keyEquivalent:@"q"];
  quit.keyEquivalentModifierMask=NSEventModifierFlagCommand;quit.target=window;
- [appMenu addItem:quit];NSApp.mainMenu=menu;
+ [appMenu addItem:quit];
+ NSMenuItem *winItem=[NSMenuItem new];[menu addItem:winItem];
+ NSMenu *winMenu=[[NSMenu alloc] initWithTitle:@"Window"];
+ [winMenu addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
+ [winMenu addItemWithTitle:@"Zoom" action:@selector(performZoom:) keyEquivalent:@""];
+ NSMenuItem *full=[winMenu addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
+ full.keyEquivalentModifierMask=NSEventModifierFlagCommand|NSEventModifierFlagControl;
+ [winMenu addItem:NSMenuItem.separatorItem];
+ [winMenu addItemWithTitle:@"Bring All to Front" action:@selector(arrangeInFront:) keyEquivalent:@""];
+ winItem.submenu=winMenu;
+ NSApp.mainMenu=menu;
+ NSApp.windowsMenu=winMenu;   /* the green button and ⌘M follow the Window menu */
 }
 static void *guest_main(void *callback){@autoreleasepool{((void(*)(void))callback)();}return NULL;}
 void runtime_front_run(void(*callback)(void)){
