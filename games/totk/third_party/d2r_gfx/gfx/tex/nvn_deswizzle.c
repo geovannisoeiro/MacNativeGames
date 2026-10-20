@@ -82,3 +82,36 @@ int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const vo
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t src_pitch, void *dst) {
     return move(d, level, layer, (uint8_t *)dst, (uint8_t *)src, src_pitch, 0);
 }
+
+// 写入一块区域到块线性存储，不经过整个级别的往返。
+// Write one region into the block-linear storage, without the whole-level round trip.
+// The round trip takes the level out of the pool, copies the region, and puts the level back: it moves
+// the whole level (8.39 MB for the 1920x1080 level in the real population) to write a region of a few
+// KB. Here each 16-byte segment of the region goes straight to where the block-linear layout wants it,
+// and the resulting pool is byte-identical to the round trip's (tests/texture_auto_layout/region_probe.c
+// compares the two over the game's own texture geometry).
+// x0/wb are the region's byte offset within the row and its bytes per row; y0/hb are the first block
+// row and the number of block rows; slice is the depth slice within the level (3D); row is the source's
+// bytes per row.
+// Returns 0 if it wrote, -1 if this texture does not qualify (linear, unsupported, slice out of range):
+// the caller then falls back to the round trip.
+int nvn_write_region_gob(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *pool,
+                         const uint8_t *src, size_t row, size_t x0, size_t wb, size_t y0, size_t hb, uint32_t slice) {
+    if (nvn_tex_is_linear(d)) return -1;   // linear: the round trip is already a copy per row
+    uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
+    if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
+    if (slice >= slices) return -1;
+    uint8_t *bl = pool + base;
+    for (size_t y = y0; y < y0 + hb; y++) {
+        const uint8_t *s = src + (y - y0) * row;
+        // 16 bytes are contiguous within a GOB, and 16 divides every block width: the segment is copied
+        // whole, and only the part that falls in the region is copied.
+        for (size_t x = (x0 / 16) * 16; x < x0 + wb; x += 16) {
+            size_t a = x > x0 ? x : x0, b = (x + 16) < x0 + wb ? (x + 16) : x0 + wb;
+            if (a >= b) continue;
+            uint8_t *p = bl + nvn_bl_offset((uint32_t)x, (uint32_t)y, slice, row_bytes, rows, th, td);
+            memcpy(p + (a - x), s + (a - x0), b - a);
+        }
+    }
+    return 0;
+}

@@ -10533,6 +10533,16 @@ static inline void wt_free(void *p) {
     free(p);
     atomic_fetch_add(&g_wt_alloc_ns, bp_now() - t0);
 }
+// TOTK (2026-10-20): escrita directa da regiao no pool, em coordenadas bloco-lineares.
+// O round trip (nvn_deswizzle do nivel inteiro -> copia da regiao -> nvn_swizzle de volta) move o
+// nivel TODO para escrever a regiao: 8,39 MB para 25,3 KB uteis na populacao real (331x). A
+// variante directa (nvn_write_region_gob, na camada tex) escreve cada segmento de 16 bytes da regiao
+// onde o GOB o quer e produz um pool byte-identico ao do round trip (provado por
+// tests/texture_auto_layout/region_probe.c).
+static int wt_direct_on(void) {   // TOTK (2026-10-20): o interruptor do probe (A/B sem rebuild)
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_GOB_DIRECT"); on = e && *e && strcmp(e, "0"); }
+    return on;
+}
 void mtl_texels_stats(uint64_t *calls, uint64_t *region, uint64_t *lin, uint64_t *gob, uint64_t *gobcalls) {
     if (calls) *calls = atomic_load(&g_wt_calls);
     if (region) *region = atomic_load(&g_wt_region_b);
@@ -10561,8 +10571,14 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
     TILELOG(t, "WriteTexels lv%u xy=%d,%d %dx%d owned %d mirrored %d flags=%#x pbh=%d tileH=%u size=%llu", level, r->xoffset, r->yoffset, r->width, r->height, gpu_owned(t->serial), tex_mirrored(t), t->d.flags, t->d.pkg_block_h, t->L.tileH, (unsigned long long)t->L.size);
     if (tex_mirrored(t)) {
         size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
-        uint8_t *lin = wt_malloc(lp * lr * lz);   // TOTK (2026-10-20): the allocator's share of this call
-        if (!lin) die("WriteTexels: out of memory");
+        // TOTK (2026-10-20): the direct write (the probe). The round trip below stays the default until
+        // the direct write is proven byte-identical in play: it moves the WHOLE level out of the pool to
+        // write the region (8.39 MB for 25.3 KB of payload in the real population, 331x). The direct
+        // write puts each 16-byte segment of the region where the block-linear layout wants it, and
+        // produces the same pool bytes.
+        int direct = wt_direct_on() && !nvn_tex_is_linear(&t->d);
+        uint8_t *lin = direct ? NULL : wt_malloc(lp * lr * lz);   // TOTK (2026-10-20): the allocator's share of this call
+        if (!direct && !lin) die("WriteTexels: out of memory");
         dm_guest_write_prepare(t->mem, t->L.size);
         {   // TOTK (2026-10-20): what this call moves. The GOB span of the level is the difference of
             // two level offsets (the tile shrinks per level, and the last level's delta is the layer total);
@@ -10577,6 +10593,14 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
         }
         for (int z = 0; z < nz; z++) {
             unsigned layer = is3d ? 0 : layer0 + r->zoffset + z;
+            if (direct) {   // TOTK (2026-10-20): the region's segments, straight into the pool
+                uint32_t slice = is3d ? (uint32_t)(r->zoffset + z) : 0;
+                uint64_t _wt_c0 = bp_now();
+                if (nvn_write_region_gob(&t->d, level, layer, (uint8_t *)t->mem, src + (size_t)z * img, row,
+                                        x0, wb, y0, hb, slice)) die("WriteTexels: unsupported layout");
+                atomic_fetch_add(&g_wt_copy_ns, bp_now() - _wt_c0);
+                continue;
+            }
             if ((is3d && z == 0) || !is3d) if (wt_deswizzle(&t->d, level, layer, t->mem, lin, lp)) die("WriteTexels: unsupported layout");
             uint8_t *dst = lin + (is3d ? (size_t)(r->zoffset + z) * lp * lr : 0);
             uint64_t _wt_c0 = bp_now();   // TOTK (2026-10-20): the region's own copy (the useful part)
@@ -10584,7 +10608,7 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
             atomic_fetch_add(&g_wt_copy_ns, bp_now() - _wt_c0);
             if (!is3d || z == nz - 1) if (wt_swizzle(&t->d, level, layer, lin, lp, t->mem)) die("WriteTexels: unsupported layout");
         }
-        wt_free(lin);
+        if (lin) wt_free(lin);
         /* TOTK: a mirrored texture the GPU has rendered into is never re-uploaded from its pool bytes (tex_mtl), so the
            write goes into the MTLTexture as well (below); the pool bytes stay in step for texture objects created later. */
         if (!gpu_owned(t->serial)) return;
