@@ -2982,6 +2982,12 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             trow(f, "@wt_alloc_us", (double)(wa - pwa) / 1e3);
             trow(f, "@wt_copy_us", (double)(wcp - pwcp) / 1e3);
             pwc = wc; pwr = wr; pwl = wl; pwg = wg; pgg = wgc; pwd = wd; pws = ws; pwa = wa; pwcp = wcp;
+            // TOTK (2026-10-20): the in-game identity of the direct region write (TOTK_GOB_VERIFY). The
+            // verdict must not depend on someone reading the log for a line.
+            uint64_t gv, gm; mtl_texels_gob_stats(&gv, &gm);
+            static uint64_t pgv, pgm;
+            trow(f, "@gob_verified", (double)(gv - pgv)); trow(f, "@gob_mismatch", (double)(gm - pgm));
+            pgv = gv; pgm = gm;
         }
         static uint64_t pmc, pmp, pmn; uint64_t mc_, mpg_, mn_; nvn_dirty_mp_stats(&mc_, &mpg_, &mn_);
         trow(f, "@mprotect_calls", (double)(mc_ - pmc)); trow(f, "@mprotect_pages", (double)(mpg_ - pmp)); trow(f, "@mprotect_ms", (mn_ - pmn) / 1e6); pmc = mc_; pmp = mpg_; pmn = mn_;
