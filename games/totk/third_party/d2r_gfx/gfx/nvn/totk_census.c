@@ -30,7 +30,11 @@
 
 static int census_class(const char *name) {
     if (!strncmp(name, "totk-guest-", 11)) return TOTK_CENSUS_CLASS_GUEST;   // the guest's own threads
-    if (!strncmp(name, "totk-", 5) || !strncmp(name, "nvn-", 4) || !strncmp(name, "TOTK ", 5)) return TOTK_CENSUS_CLASS_PORT;
+    // TOTK (2026-10-21): "gcd-pool" is the name the warm-up's threads go back to when it ends (the GDC reuses
+    // them for whatever comes next). Without it here, the port's post-warm-up work moved from the "port" bucket
+    // to "other" — the same hiding the fix was meant to end, one bucket over. The census cannot split a shared
+    // thread, so it attributes the pool to the port, which is the side that dispatches on it.
+    if (!strncmp(name, "totk-", 5) || !strncmp(name, "nvn-", 4) || !strncmp(name, "TOTK ", 5) || !strncmp(name, "gcd-pool", 8)) return TOTK_CENSUS_CLASS_PORT;
     return TOTK_CENSUS_CLASS_OTHER;
 }
 static const char *class_name(int cls) {
