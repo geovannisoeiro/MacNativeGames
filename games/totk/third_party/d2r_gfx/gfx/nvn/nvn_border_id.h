@@ -14,9 +14,12 @@ static inline uint64_t border_id_hash(const char *s) {   // FNV-1a 64
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) { h ^= *p; h *= 1099511628211ull; }
     return h ? h : 1;   // 0 means "no border"
 }
-// "12:0x1p-1,0x1p-1,0x1p-1,0x1p-1;" -> the argument id and the colour of one sampler. The colour is
-// written by border_key with "%a" (a hex float), which strtof reads back exactly. 0 on success.
-static inline int border_parse(const char *key, float colours[][4], int aids[], int *n) {
+// "12:3:0x1p-1,0x1p-1,0x1p-1,0x1p-1;" -> the argument id, the ADDRESSING AXES and the colour of
+// one sampler. The colour is written by border_key with "%a" (a hex float), which strtof reads back
+// exactly. The axes are the upstream's (the emulation is per axis: a clamp on x is not a clamp on
+// y), so the identity has to say which axes the sampler clamps — else two variants that differ only
+// in the addressing would share a hash and the warm-up would rebuild the wrong one. 0 on success.
+static inline int border_parse(const char *key, float colours[][4], int aids[], unsigned axes[], int *n) {
     *n = 0;
     if (!key) return -1;
     const char *p = key;
@@ -25,6 +28,10 @@ static inline int border_parse(const char *key, float colours[][4], int aids[], 
         long aid = strtol(p, &end, 10);
         if (end == p || *end != ':') return -1;
         p = end + 1;
+        char *e0 = NULL;
+        unsigned long ax = strtoul(p, &e0, 10);
+        if (e0 == p || *e0 != ':') return -1;
+        p = e0 + 1;
         for (int c = 0; c < 4; c++) {
             char *e2 = NULL;
             float v = strtof(p, &e2);
@@ -34,6 +41,7 @@ static inline int border_parse(const char *key, float colours[][4], int aids[], 
             if (c < 3) { if (*p != ',') return -1; p++; }
         }
         aids[*n] = (int)aid;
+        axes[*n] = (unsigned)ax;
         ++*n;
         if (*p != ';') return -1;
         p++;

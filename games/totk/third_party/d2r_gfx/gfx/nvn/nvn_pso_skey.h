@@ -9,6 +9,12 @@ typedef struct {
     const void *vs, *fs; uint32_t cfmt[8], dfmt, sfmt, samples, blend_en, chmask, a2c; blend_st blend[8];
     va_st attr[16]; vs_st stream[16];
     uint8_t lmap[8]; const void *fsfn;
+    // TOTK (2026-10-21): the identity of the sampler's border-colour variant. It is a HASH of the
+    // border_key string of both stages, never a pointer: the patch caches (fs->bpatch / vs->vpatch)
+    // are per NvShader INSTANCE, and the warm-up and the game do not share instances, so a pointer
+    // in the key could never match. 0 = no border. The field is at the END so that the legacy rows
+    // (which are, by construction, rows without a border) decode with it zeroed.
+    uint64_t bid;
 } pso_key;
 // pso_key.a2c: bit 0 alpha-to-coverage; bit 1 (TOTK) layered pass, the vertex function writes the render target array index;
 // bits 2-3 (TOTK_MFX) MetalFX copy role of the draw: 1 scene to attachment 6, 2 / 3 UI (blended / opaque) to attachment 7;
@@ -49,8 +55,14 @@ static inline void pso_skey_hex(const pso_skey *key, char *out) {
 }
 
 static inline int pso_skey_parse(const char *hex, pso_skey *out) {
-    size_t n = sizeof *out * 2;
-    if (!hex || strlen(hex) != n) return -1;
+    // TOTK (2026-10-21): two lengths are valid — the current one, and the legacy one (before the
+    // border identity field). A legacy row is by construction a row WITHOUT a border (the recorder
+    // cleared the bit and the fsfn pointer), so decoding it with bid = 0 is factually correct and
+    // not a guess. Any other length is a row this build cannot read.
+    size_t n = hex ? strlen(hex) : 0;
+    size_t full = sizeof *out * 2, legacy = (sizeof *out - sizeof(uint64_t)) * 2;
+    if (n != full && n != legacy) return -1;
+    memset(out, 0, sizeof *out);   // a linha legado nao escreve o bid: tem de ficar a zero
     uint8_t *p = (uint8_t *)out;
     for (size_t i = 0; i < n; i += 2) {
         int a = hex[i] >= '0' && hex[i] <= '9' ? hex[i] - '0' : hex[i] >= 'a' && hex[i] <= 'f' ? hex[i] - 'a' + 10 : hex[i] >= 'A' && hex[i] <= 'F' ? hex[i] - 'A' + 10 : -1;
