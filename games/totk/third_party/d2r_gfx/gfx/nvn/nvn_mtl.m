@@ -6633,18 +6633,18 @@ static void warm_plan(NSArray<NSString *> *paths, NSArray<NSString *> *files, NS
             [rows addObject:line];
             NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
             if ([c[0] isEqualToString:@"S"] && c.count >= 3 && [c[1] length]) {
-                if (!warm_available(c[1])) { g_warm_skip_missing++; continue; }
+                if (!warm_have(c[1])) { g_warm_skip_missing++; continue; }
                 [keys addObject:c[1]];
             }
             else if ([c[0] isEqualToString:@"R"] && c.count >= 2) {
                 pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk)) { g_warm_skip_parse++; continue; }
                 NSString *vs = warm_key(sk.vs, sizeof sk.vs), *fs = warm_key(sk.fs, sizeof sk.fs);
                 // Evaluate both so the missing-shader count remains deduplicated.
-                int av = warm_available(vs), af = warm_available(fs);
+                int av = warm_have(vs), af = warm_have(fs);
                 if (!av || !af) { g_warm_skip_missing++; continue; }
                 if (vs.length) [keys addObject:vs]; if (fs.length) [keys addObject:fs]; ++*pipelines;
             } else if ([c[0] isEqualToString:@"C"] && c.count >= 2 && [c[1] length]) {
-                if (!warm_available(c[1])) { g_warm_skip_missing++; continue; }
+                if (!warm_have(c[1])) { g_warm_skip_missing++; continue; }
                 [keys addObject:c[1]]; ++*pipelines;
             } else { g_warm_skip_other++; continue; }
             [eligible addObject:line]; ++*tasks;
