@@ -5211,6 +5211,9 @@ typedef struct { void *pk; uint64_t used, bytes, serial; } evict_cand;
 static uint64_t g_pkg_evicted, g_pkg_evicted_mb_x, g_evict_sweeps;
 static int evict_cmp(const void *a, const void *b) { uint64_t x = ((const evict_cand *)a)->used, y = ((const evict_cand *)b)->used; return x < y ? -1 : x > y; }
 static uint64_t env_mb(const char *name, uint64_t dflt) { const char *e = getenv(name); return (e && *e ? strtoull(e, NULL, 10) : dflt) << 20; }
+/* Mac: there is no os_proc_available_memory; the kernel's own pressure level is the signal (1 normal, 2 warn, 4 critical).
+   Opt-in only (TOTK_TEX_EVICT=1): free pages sit at ~40-60 MB on a healthy 8 GB run, so a free-memory threshold would always fire. */
+static int evict_mac_pressure(void) { int v = 0; size_t n = sizeof v; return sysctlbyname("kern.memorystatus_vm_pressure_level", &v, &n, NULL, 0) ? 0 : v; }
 static uint64_t evict_available(void) {
 #if TARGET_OS_IPHONE
     return os_proc_available_memory();
@@ -5272,13 +5275,17 @@ static void pkg_evict_sweep(void) {
     if (mode < 0) {
         const char *e = getenv("TOTK_TEX_EVICT");
         budget = env_mb("TOTK_TEX_EVICT_MB", 0); low = env_mb("TOTK_TEX_EVICT_LOW_MB", 600); high = env_mb("TOTK_TEX_EVICT_HIGH_MB", 850); crit = env_mb("TOTK_TEX_EVICT_CRIT_MB", 300);
-        mode = e && !atoi(e) ? 0 : budget ? 2 : TARGET_OS_IPHONE ? 1 : 0;
+        mode = e && !atoi(e) ? 0 : budget ? 2 : TARGET_OS_IPHONE ? 1 : e ? 3 : 0;   // 3 (Mac, opt-in): kernel pressure level
         if (mode == 1) MLOG("贴图副本淘汰：开（可用内存低于 %llu MB 时淘汰久未使用的副本，直到 %llu MB；TOTK_TEX_EVICT=0 关）", (unsigned long long)(low >> 20), (unsigned long long)(high >> 20));
         if (mode == 2) MLOG("贴图副本淘汰：开（副本总量上限 %llu MB）", (unsigned long long)(budget >> 20));
+        if (mode == 3) MLOG("贴图副本淘汰：开（Mac：内核内存压力 ≥ 警告 时淘汰久未使用的副本；TOTK_TEX_EVICT=0 关）");
     }
-    if (!mode || (g_sub_serial & 3)) return;
-    uint64_t avail = 0, want = 0;
+    static uint64_t last_census;   // mode 0 still counts the eligible copies, so E in the world is a measurement and not an inference
+    int census = (!mode || mode == 3) && g_sub_serial - last_census >= 600;
+    if ((!mode && !census) || (g_sub_serial & 3)) return;
+    uint64_t avail = 0, want = 0; int lvl = 0;
     if (mode == 1) { avail = evict_available(); if (!avail || avail >= low) return; want = high - avail; }
+    if (mode == 3) { lvl = evict_mac_pressure(); if (lvl < 2 && !census) return; }
     pthread_mutex_lock(&g_rmu);
     pthread_mutex_lock(&g_smu);
     /* texture-pool ids resolved on the fast path count as uses of their serial's copy */
@@ -5289,7 +5296,7 @@ static void pkg_evict_sweep(void) {
     }
     size_t n = 0, cap = 0; evict_cand *c = NULL; uint64_t total = 0, total_n = 0;
     NSUInteger fmt_pf[16]; uint64_t fmt_b[16], fmt_n[16]; int nfmt = 0;   // copies by Metal pixel format (log)
-    uint64_t idle = mode == 1 && avail < crit ? EVICT_IDLE_CRIT : EVICT_IDLE;
+    uint64_t idle = (mode == 1 && avail < crit) || (mode == 3 && lvl >= 4) ? EVICT_IDLE_CRIT : EVICT_IDLE;
     for (uint32_t i = 0; i < g_by_serial.cap; i++) {
         __unsafe_unretained id o = (__bridge id)g_by_serial.vals[i];
         if (!o || ![o isKindOfClass:[NvPkg class]]) continue;
@@ -5302,6 +5309,8 @@ static void pkg_evict_sweep(void) {
         c[n++] = (evict_cand){(__bridge void *)pk, pk->used, bytes, ser};
     }
     if (mode == 2) want = total > budget ? total - budget / 10 * 9 : 0;
+    if (mode == 3) want = lvl >= 4 ? total : lvl >= 2 ? total / 4 : 0;   // warn: a quarter of the eligible copies, critical: all that idled 8 submissions
+    if (census) { last_census = g_sub_serial; MLOG("贴图副本普查：可淘汰副本 %llu 张 / %llu MB，其中闲置 ≥%llu 次提交 %zu 张（模式 %d，内核压力 %d）", (unsigned long long)total_n, (unsigned long long)(total >> 20), (unsigned long long)idle, n, mode, lvl); if (!mode) { free(c); pthread_mutex_unlock(&g_smu); pthread_mutex_unlock(&g_rmu); return; } }
     uint64_t freed = 0, k = 0;
     if (want && n) {
         qsort(c, n, sizeof *c, evict_cmp);
