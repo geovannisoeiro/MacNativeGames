@@ -13315,7 +13315,7 @@ int mtl_probe_depth_output(void) {
     for (int hasDepth = 0; hasDepth < 2; hasDepth++) {
         pso_key k = {0}; k.cfmt[0] = MTLPixelFormatRGBA8Unorm; k.samples = 1; k.chmask = 15;
         k.dfmt = hasDepth ? MTLPixelFormatDepth32Float : 0;
-        MTLRenderPipelineDescriptor *pd = pso_desc(&k, vs, fs, nil, 0);
+        MTLRenderPipelineDescriptor *pd = pso_desc(&k, vs, fs, nil, 0, nil);
         if (!hasDepth && getenv("TOTK_PROBE_NEGATIVE")) pd.fragmentFunction = fs->fn;
         id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
         if (!ps) MDIE("depth output probe pipeline: %s", err.localizedDescription.UTF8String);
@@ -14410,7 +14410,7 @@ int mtl_probe_vertex_streams(void) {
         for(unsigned i=0;i<15;i++){S.stream[i].stride=16;S.vbuf[i]=(NVNbufferRange){.address=(uint64_t)(uintptr_t)mem+512,.size=48};}
         S.vbuf[2].address=(uint64_t)(uintptr_t)mem;S.vbuf[scenario==1?7:5].address=(uint64_t)(uintptr_t)mem+256;
         uint32_t formats[8]={MTLPixelFormatRGBA8Unorm};pso_key key;pso_key_fill(&key,vs,fs,formats,0,0,1,0);key.chmask=15;
-        MTLRenderPipelineDescriptor *pd=pso_desc(&key,vs,fs,nil,0);
+        MTLRenderPipelineDescriptor *pd=pso_desc(&key,vs,fs,nil,0,nil);
         id<MTLRenderPipelineState> ps=[g_dev newRenderPipelineStateWithDescriptor:pd error:&error];if(!ps)MDIE("vertex stream probe pipeline: %s",error.localizedDescription.UTF8String);
         MTL4RenderPassDescriptor *rp=[MTL4RenderPassDescriptor new];rp.colorAttachments[0].texture=texture;rp.colorAttachments[0].loadAction=MTLLoadActionClear;rp.colorAttachments[0].storeAction=MTLStoreActionStore;
         rp.renderTargetWidth=rp.renderTargetHeight=16;id<MTL4RenderCommandEncoder> en=enc_r_begin(rp);enc_r_pso(en,ps);enc_r_cull(en,MTLCullModeNone);
